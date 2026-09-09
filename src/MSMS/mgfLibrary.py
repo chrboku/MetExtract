@@ -201,7 +201,7 @@ def resolve_precursor_mz(metadata, precursor_mz_key=None):
     """
     if precursor_mz_key and precursor_mz_key in metadata:
         return _parse_float_field(metadata[precursor_mz_key])
-    value = _find_by_last_segment(metadata, {"precursor_mz", "pepmass", "precursor_m/z"})
+    value = _find_by_last_segment(metadata, {"precursor_mz", "pepmass", "precursor_m/z", "precursormz"})
     return _parse_float_field(value)
 
 
@@ -293,6 +293,134 @@ def load_mgf_file(path, precursor_mz_key=None, polarity_key=None):
             )
         )
     logging.info(f"Loaded {len(spectra)} spectra from MGF library file '{path}'")
+    return spectra
+
+
+# ---------------------------------------------------------------------------
+# MSP spectral library parsing (NIST/MassBank-style "Key: Value" metadata blocks,
+# separated by blank lines, without MGF's "BEGIN IONS"/"END IONS" markers).
+# ---------------------------------------------------------------------------
+
+_MSP_NUM_PEAKS_KEYS = ("num peaks", "numpeaks")
+
+
+def _parse_msp_blocks(path):
+    """Parse a .msp file into a list of (metadata_dict, mz_list, intensity_list) tuples,
+    one per entry, preserving metadata field names exactly as written (before the first
+    ":"). Entries are separated by one or more blank lines; each entry starts with
+    "Key: Value" metadata lines, followed by a "Num Peaks: N" line and then N lines of
+    "mz intensity[ annotation]" peak data."""
+    blocks = []
+    metadata = {}
+    mz = []
+    intensities = []
+    num_peaks_expected = None
+    peaks_read = 0
+    in_entry = False
+
+    def _flush():
+        if in_entry and (metadata or mz):
+            blocks.append((metadata, mz, intensities))
+
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+
+            if not line:
+                # Blank line: end of the current entry (if one is open) once all its peaks were read.
+                if in_entry and (num_peaks_expected is None or peaks_read >= num_peaks_expected):
+                    _flush()
+                    metadata = {}
+                    mz = []
+                    intensities = []
+                    num_peaks_expected = None
+                    peaks_read = 0
+                    in_entry = False
+                continue
+
+            if num_peaks_expected is not None and peaks_read < num_peaks_expected:
+                parts = line.replace(",", " ").split()
+                if len(parts) >= 2:
+                    try:
+                        mz.append(float(parts[0]))
+                        intensities.append(float(parts[1]))
+                        peaks_read += 1
+                        continue
+                    except ValueError:
+                        pass
+
+            if ":" in line:
+                key, _, value = line.partition(":")
+                key = key.strip()
+                value = value.strip()
+                if not in_entry:
+                    in_entry = True
+                    metadata = {}
+                    mz = []
+                    intensities = []
+                    num_peaks_expected = None
+                    peaks_read = 0
+                if key.lower() in _MSP_NUM_PEAKS_KEYS:
+                    try:
+                        num_peaks_expected = int(value.split()[0])
+                    except (ValueError, IndexError):
+                        num_peaks_expected = None
+                elif key in metadata:
+                    # Repeated keys (e.g. multiple "Synon:" lines) are collected into a list.
+                    if isinstance(metadata[key], list):
+                        metadata[key].append(value)
+                    else:
+                        metadata[key] = [metadata[key], value]
+                else:
+                    metadata[key] = value
+
+    if in_entry:
+        _flush()
+
+    return blocks
+
+
+def discover_msp_properties(path):
+    """Return the sorted set of all metadata field names found across all spectra in an MSP file."""
+    properties = set()
+    for metadata, _mz, _intensities in _parse_msp_blocks(path):
+        properties.update(metadata.keys())
+    return sorted(properties)
+
+
+def load_msp_file(path, precursor_mz_key=None, polarity_key=None):
+    """
+    Load all spectra from a single .msp file.
+
+    Args:
+        path: path to the .msp file
+        precursor_mz_key: name of the metadata field (as written in the file, e.g.
+            "PrecursorMZ") to use as the precursor m/z; falls back to common field names
+            if not given/found.
+        polarity_key: name of the metadata field (as written in the file, e.g. "Ion_mode")
+            to use as the polarity ("Positive"/"pos"/"+"/"Negative"/"neg"/"-",
+            case-insensitive); falls back to ION_MODE/CHARGE/adduct heuristics if not
+            given/found.
+
+    Returns a list of MGFLibrarySpectrum objects.
+    """
+    spectra = []
+    for idx, (metadata, mz, intensities) in enumerate(_parse_msp_blocks(path)):
+        polarity, polarity_source = resolve_polarity(metadata, polarity_key)
+        spectra.append(
+            MGFLibrarySpectrum(
+                mz,
+                intensities,
+                metadata,
+                source_file=path,
+                spectrum_index=idx,
+                precursor_mz=resolve_precursor_mz(metadata, precursor_mz_key),
+                compound_name=resolve_compound_name(metadata, idx),
+                polarity=polarity,
+                polarity_source=polarity_source,
+            )
+        )
+    logging.info(f"Loaded {len(spectra)} spectra from MSP library file '{path}'")
     return spectra
 
 
@@ -398,13 +526,18 @@ def load_json_file(path, precursor_mz_key=None, polarity_key=None):
 def discover_properties(path, file_type):
     if file_type == "json":
         return discover_json_properties(path)
+    if file_type == "msp":
+        return discover_msp_properties(path)
     return discover_mgf_properties(path)
 
 
 def load_library_file(path, file_type, precursor_mz_key=None, polarity_key=None):
-    """Dispatch to load_mgf_file or load_json_file based on ``file_type`` ("mgf"/"json")."""
+    """Dispatch to load_mgf_file, load_json_file or load_msp_file based on ``file_type``
+    ("mgf"/"json"/"msp")."""
     if file_type == "json":
         return load_json_file(path, precursor_mz_key, polarity_key)
+    if file_type == "msp":
+        return load_msp_file(path, precursor_mz_key, polarity_key)
     return load_mgf_file(path, precursor_mz_key, polarity_key)
 
 
@@ -421,6 +554,13 @@ def load_library_entry(entry):
 def spectra_without_polarity(library_spectra):
     """Return the subset of library spectra for which polarity could not be resolved."""
     return [s for s in library_spectra if s.polarity is None]
+
+
+def spectra_missing_precursor_mz(library_spectra):
+    """Return the subset of library spectra missing a usable precursor m/z or fragment peaks.
+    These spectra lack information required for matching and are always excluded (see
+    ``prepare_library_spectra`` and ``match_spectrum_against_library``)."""
+    return [s for s in library_spectra if s.precursor_mz is None or s.mz.size == 0]
 
 
 def get_similarity_algorithm(name, mz_tolerance):
@@ -444,7 +584,7 @@ def prepare_library_spectra(library_spectra, fragment_min_rel_abundance=0.0):
     """Prepare and cache matchms spectra for a library list exactly once per threshold."""
     threshold = float(fragment_min_rel_abundance or 0.0)
     for lib_spec in library_spectra:
-        if lib_spec is None or lib_spec.mz.size == 0:
+        if lib_spec is None or lib_spec.mz.size == 0 or lib_spec.precursor_mz is None:
             continue
         if lib_spec.matchms_spectrum is not None and lib_spec.matchms_prepared_fragment_min_rel_abundance == threshold:
             continue
@@ -532,15 +672,17 @@ def match_spectrum_against_library(
 
     results = []
     for lib_spec in library_spectra:
+        # a library spectrum without a precursor m/z or fragment peaks lacks information required
+        # for matching and is always excluded
+        if lib_spec.precursor_mz is None or lib_spec.mz.size == 0:
+            continue
         # optional polarity check
         if exp_polarity and lib_spec.polarity and lib_spec.polarity != exp_polarity:
             continue
         # optional precursor m/z matching check (only if both are known and requirement enabled)
-        if require_same_precursor_mz and exp_precursor_mz is not None and lib_spec.precursor_mz is not None:
+        if require_same_precursor_mz and exp_precursor_mz is not None:
             if abs(exp_precursor_mz - lib_spec.precursor_mz) > precursor_mz_tolerance:
                 continue
-        if lib_spec.mz.size == 0:
-            continue
 
         lib_matchms_spectrum = lib_spec.matchms_spectrum
         if lib_matchms_spectrum is None:

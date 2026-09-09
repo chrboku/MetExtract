@@ -328,6 +328,7 @@ class PeakPickingSettingsDialog(QtWidgets.QDialog):
             style="italic",
             fontsize=11,
         )
+        self._eic_figure.tight_layout()
         self._eic_canvas.draw()
 
     def _show_status_text(self, message: str, color: str = "gray"):
@@ -346,6 +347,7 @@ class PeakPickingSettingsDialog(QtWidgets.QDialog):
                 style="italic",
                 fontsize=10,
             )
+            self._eic_figure.tight_layout()
             self._eic_canvas.draw()
         else:
             self.eicPlotArea.setText(message)

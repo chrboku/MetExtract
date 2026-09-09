@@ -109,6 +109,7 @@ class MSMSSpectraOverviewDialog(QtWidgets.QDialog):
         self.ax.set_xlabel("m/z")
         self.ax.set_ylabel("Intensity")
         self.ax.set_title(spec.compound_name)
+        self.figure.tight_layout()
         self.canvas.draw_idle()
 
         rows = [

@@ -273,6 +273,7 @@ class InteractiveVolcanoCanvas(FigureCanvas):
             self.axes.text(0.5, 0.5, f"Error:\n{error_msg}", ha="center", va="center", transform=self.axes.transAxes, fontsize=10, color="red", wrap=True)
             self.axes.set_xlim(0, 1)
             self.axes.set_ylim(0, 1)
+            self.fig.tight_layout()
             self.draw()
             return
 
@@ -287,6 +288,7 @@ class InteractiveVolcanoCanvas(FigureCanvas):
         # Check if we have data to plot
         if len(log2_fc) == 0:
             self.axes.text(0.5, 0.5, "No features to plot", ha="center", va="center", transform=self.axes.transAxes, fontsize=12, color="gray")
+            self.fig.tight_layout()
             self.draw()
             return
 

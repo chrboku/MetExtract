@@ -413,6 +413,24 @@ def interruptConvolutingOfFeaturePairs(selfObj, funcProc):
         return False  # don't close progresswrapper and continue processing files
 
 
+def _get_ms2_scan_filter_string(scan):
+    """Module-level counterpart to MExtract._get_msms_filter_string, usable in worker
+    processes (which do not have access to the main window instance)."""
+    if scan is None:
+        return ""
+    fs = getattr(scan, "filter_string", None)
+    if fs and ("N/A" not in fs and "Unknown" not in fs):
+        return fs
+    if hasattr(scan, "cvParams") and scan.cvParams:
+        for cv in scan.cvParams:
+            if cv.get("accession") == "MS:1000512":
+                return cv.get("value", "") or ""
+    fl = getattr(scan, "filter_line", None)
+    if fl and ("N/A" in fl or "Unknown" in fl or fl.startswith("NA //") or fl.startswith("MSn ")):
+        return ""
+    return fl or ""
+
+
 def loadMZXMLFile(params):
     # {"File":fi, "Group":group.name, "IntensityThreshold":intensityThrehold}
 
@@ -429,6 +447,15 @@ def loadMZXMLFile(params):
 
     mzXML = Chromatogram()
     mzXML.parse_file(params["File"], intensityCutoff=params["IntensityThreshold"], mzFilter=mzFilter)
+
+    msms_filter_regex_pattern = params.get("MSMSFilterRegex")
+    if msms_filter_regex_pattern:
+        try:
+            compiled_regex = re.compile(msms_filter_regex_pattern)
+        except re.error:
+            compiled_regex = None
+        if compiled_regex is not None and hasattr(mzXML, "MS2_list"):
+            mzXML.MS2_list = [scan for scan in mzXML.MS2_list if compiled_regex.search(_get_ms2_scan_filter_string(scan) or "")]
 
     ret = {
         "File": params["File"],
@@ -1971,8 +1998,6 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
     # <editor-fold desc="### group results visualisation functions">
     # EXPERIMENTAL
     def loadGroupsResultsFile(self, groupsResFile):
-        experimentalGroups = self.getAllSampleGroups()
-
         try:
             self.ui.resultsExperiment_TreeWidget.clear()
             self.ui.resultsExperiment_TreeWidget.setHeaderLabels(["OGroup", "MZ", "RT", "Xn", "Z", "IonMode", "MS2 N/L"])
@@ -2003,192 +2028,18 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                     return
 
                 self.experimentResults.selected_table = selected_table
-
-                metaboliteGroupTreeItems = {}
-                # Get distinct OGroup values from GroupResults, ordered by rt
                 group_results_df = self.experimentResults.db_con.tables[selected_table]
-                distinct_groups = group_results_df.group_by("OGroup").agg(RT=pl.col("RT").mean()).sort("RT")
 
-                for row_dict in distinct_groups.to_dicts():
-                    metaboliteGroup = Bunch(type="metaboliteGroup", metaboliteGroupID=row_dict["OGroup"])
-                    metaboliteGroupTreeItem = QtWidgets.QTreeWidgetItem(["%s" % metaboliteGroup.metaboliteGroupID])
-                    metaboliteGroupTreeItem.bunchData = metaboliteGroup
-                    self.ui.resultsExperiment_TreeWidget.addTopLevelItem(metaboliteGroupTreeItem)
-                    metaboliteGroupTreeItems[metaboliteGroup.metaboliteGroupID] = metaboliteGroupTreeItem
-                kids = []
+                # Populate the grouping-column selector with the data-matrix columns,
+                # defaulting to "OGroup" (without triggering a redundant tree rebuild).
+                self.ui.comboBox_expGroupingColumn.blockSignals(True)
+                self.ui.comboBox_expGroupingColumn.clear()
+                self.ui.comboBox_expGroupingColumn.addItems(list(group_results_df.columns))
+                default_idx = self.ui.comboBox_expGroupingColumn.findText("OGroup")
+                self.ui.comboBox_expGroupingColumn.setCurrentIndex(max(0, default_idx))
+                self.ui.comboBox_expGroupingColumn.blockSignals(False)
 
-                if False:
-                    fileMappingData = {}
-                    # Get file results from FoundFeaturePairs, ordered by areaN DESC
-                    found_fps_df = self.experimentResults.db_con.tables["FoundFeaturePairs"].sort("areaN", descending=True)
-
-                    for row_dict in found_fps_df.to_dicts():
-                        fileRes = Bunch(type="fileResult", resID=row_dict["resID"], file=row_dict["file"], areaN=row_dict["areaN"], areaL=row_dict["areaL"])
-                        if fileRes.resID not in fileMappingData.keys():
-                            fileMappingData[fileRes.resID] = []
-
-                        fileMappingData[fileRes.resID].append(fileRes)
-
-                    # Get feature pairs with count of found files
-                    found_counts = self.experimentResults.db_con.tables["FoundFeaturePairs"].group_by("resID").agg(pl.count("resID").alias("FOUNDINCOUNT"))
-                    fp_with_counts = group_results_df.join(found_counts, left_on="id", right_on="resID", how="left")
-                    fp_with_counts = fp_with_counts.sort("mz")
-
-                # Build max-normalized abundance ratios per group: ratio = Average_peakarea / group max.
-                exp_ratio_by_num = {}
-                if "Average_peakarea" in group_results_df.columns and "OGroup" in group_results_df.columns and "Num" in group_results_df.columns:
-                    _grp_max = {row["OGroup"]: float(row["_max"]) for row in group_results_df.group_by("OGroup").agg(pl.col("Average_peakarea").max().alias("_max")).to_dicts() if row.get("_max") is not None and float(row["_max"]) > 0.0}
-                    for row in group_results_df.select(["Num", "OGroup", "Average_peakarea"]).to_dicts():
-                        gmax = _grp_max.get(row["OGroup"])
-                        avg_area = row.get("Average_peakarea")
-                        if gmax is not None and avg_area is not None:
-                            exp_ratio_by_num[row["Num"]] = float(avg_area) / gmax
-                elif "Relative_peakarea_in_group" in group_results_df.columns and "Num" in group_results_df.columns:
-                    # Fallback only when average peak area is unavailable.
-                    exp_ratio_by_num = {row["Num"]: float(row["Relative_peakarea_in_group"]) for row in group_results_df.select(["Num", "Relative_peakarea_in_group"]).to_dicts() if row.get("Relative_peakarea_in_group") is not None}
-
-                # Precompute the list of sample (file) base names present in this result table
-                # (derived from the per-sample "<sample>_Found" columns) and a lookup from
-                # sample name -> defined-group color, used to build the per-sample child rows below.
-                sample_names_in_table = sorted(col[: -len("_Found")] for col in group_results_df.columns if col.endswith("_Found"))
-                sample_color_lookup = {}
-                for sampleGroup in experimentalGroups:
-                    for sample_name in self._sampleNamesForGroup(sampleGroup):
-                        sample_color_lookup.setdefault(sample_name, sampleGroup.color)
-
-                for row_dict in group_results_df.to_dicts():
-                    # Count N_found_Samples from per-file _Found columns or use pre-computed value
-                    n_found_samples = row_dict.get("N_found_Samples")
-                    if n_found_samples is None:
-                        n_found_samples = 0
-                        for col_name in row_dict.keys():
-                            if col_name.endswith("_Found") and row_dict[col_name] is not None:
-                                found_val = str(row_dict[col_name])
-                                if "Direct" in found_val or "Reintegrated" in found_val:
-                                    n_found_samples += 1
-
-                    fp = Bunch(
-                        type="featurePair",
-                        id=row_dict["Num"],
-                        metaboliteGroupID=row_dict["OGroup"],
-                        mz=row_dict["MZ"],
-                        lmz=row_dict.get("L_MZ"),
-                        dmz=row_dict.get("D_MZ"),
-                        rt=row_dict["RT"] * 60.0,
-                        xn=row_dict["Xn"],
-                        charge=row_dict["Charge"],
-                        scanEvent=row_dict.get("ScanEvent"),
-                        ionisationMode=row_dict.get("Ionisation_Mode"),
-                        tracer=row_dict.get("Tracer"),
-                        N_found_Samples=n_found_samples,
-                    )
-
-                    title = "%s" % (str(fp.id))
-                    try:
-                        title = "%s / %d rep." % (title, int(fp.N_found_Samples))
-                    except Exception:
-                        pass
-                    try:
-                        rel_ratio = exp_ratio_by_num.get(fp.id)
-                        if rel_ratio is not None:
-                            title = "%s / %.1f%%" % (title, rel_ratio * 100.0)
-                    except Exception:
-                        pass
-                    try:
-                        title = "%s / %.4g" % (title, row_dict.get("Average_peakarea", -1))
-                    except Exception:
-                        pass
-                    try:
-                        title = "%s / %s" % (title, row_dict.get("Ion", ""))
-                    except Exception:
-                        pass
-
-                    featurePair = QtWidgets.QTreeWidgetItem(
-                        [
-                            title,
-                            "%.4f" % fp.mz,
-                            "%.2f" % (fp.rt / 60.0),
-                            str(fp.xn),
-                            str(fp.charge),
-                            str(fp.ionisationMode),
-                            "",
-                        ]
-                    )
-                    featurePair.bunchData = fp
-
-                    # Add a child row per sample where the feature (native and/or
-                    # labeled form) was detected, either directly or by re-integration.
-                    for sample_name in sample_names_in_table:
-                        found_val = row_dict.get(sample_name + "_Found")
-                        if found_val is None:
-                            continue
-                        detect_type = str(found_val).split(";")[0]
-
-                        area_n = self._parseAreaCellValue(row_dict.get(sample_name + "_Area_N"))
-                        area_l = self._parseAreaCellValue(row_dict.get(sample_name + "_Area_L"))
-
-                        if area_n is not None and area_l is not None:
-                            form_label = "N/L"
-                        elif area_n is not None:
-                            form_label = "N"
-                        elif area_l is not None:
-                            form_label = "L"
-                        else:
-                            form_label = ""
-
-                        sampleNode = QtWidgets.QTreeWidgetItem(
-                            [
-                                sample_name,
-                                detect_type,
-                                form_label,
-                                "%.4g" % area_n if area_n is not None else "",
-                                "%.4g" % area_l if area_l is not None else "",
-                            ]
-                        )
-                        sampleNode.bunchData = Bunch(
-                            type="sampleResult",
-                            sampleName=sample_name,
-                            foundType=detect_type,
-                            form=form_label,
-                            areaN=area_n,
-                            areaL=area_l,
-                        )
-
-                        color = sample_color_lookup.get(sample_name)
-                        if color is not None:
-                            for col in range(5):
-                                sampleNode.setBackground(col, QColor(color))
-
-                        featurePair.addChild(sampleNode)
-
-                    kids.append((featurePair, -1, fp.metaboliteGroupID))
-
-                # Build a lookup {Num -> relative_ratio} for the bar delegate.
-                # Reuse the same max-normalized lookup for delegate bars.
-                _exp_bar_ratio = exp_ratio_by_num
-
-                for fg in set([k[2] for k in kids]):
-                    ckids = sorted(
-                        [k for k in kids if k[2] == fg],
-                        key=lambda x: x[1],
-                        reverse=True,
-                    )
-                    for kid in ckids:
-                        ratio = _exp_bar_ratio.get(kid[0].bunchData.id)
-                        if ratio is not None:
-                            kid[0].setData(0, _RELATIVE_BAR_ROLE, float(ratio))
-                        metaboliteGroupTreeItems[kid[2]].addChild(kid[0])
-
-                for grpID in metaboliteGroupTreeItems.keys():
-                    kids = []
-                    for i in range(metaboliteGroupTreeItems[grpID].childCount()):
-                        kids.append(metaboliteGroupTreeItems[grpID].child(i))
-                    meanRT = mean([float(kid.text(2)) for kid in kids])
-                    metaboliteGroupTreeItems[grpID].setText(1, "%d" % len(kids))
-                    metaboliteGroupTreeItems[grpID].setText(2, "%.2f" % meanRT)
-
-                # Load data into Statistics tab
-                self._loadStatisticsData(from_sheet=selected_table)
+                self._buildExperimentResultsTree(group_results_df, selected_table)
 
         except Exception as e:
             traceback.print_exc()
@@ -2196,6 +2047,309 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
             logging.error("Multiple file results could not be fetched correctly: " + str(e))
             pass
+
+    def _addGroupingLevelRow(self):
+        """Add another grouping-level row (a combobox with +/- buttons) below the existing
+        grouping-level rows, letting the user nest features by an additional column."""
+        row_widget = QtWidgets.QWidget(self.ui.expGroupingLevelsContainer)
+        row_layout = QtWidgets.QHBoxLayout(row_widget)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+
+        combo = QtWidgets.QComboBox(row_widget)
+        level = len(self._groupingLevelRows) + 2
+        combo.setToolTip(f"Data-matrix column used for grouping level {level} (nested under the previous level).")
+        for i in range(self.ui.comboBox_expGroupingColumn.count()):
+            combo.addItem(self.ui.comboBox_expGroupingColumn.itemText(i))
+        row_layout.addWidget(combo)
+
+        add_btn = QtWidgets.QPushButton("+", row_widget)
+        add_btn.setMaximumWidth(28)
+        add_btn.setStyleSheet("padding: 2px 4px;")
+        remove_btn = QtWidgets.QPushButton("-", row_widget)
+        remove_btn.setMaximumWidth(28)
+        remove_btn.setStyleSheet("padding: 2px 4px;")
+        row_layout.addWidget(add_btn)
+        row_layout.addWidget(remove_btn)
+
+        self.ui.expGroupingLevelsContainer_layout.addWidget(row_widget)
+        row = {"widget": row_widget, "combo": combo, "addBtn": add_btn, "removeBtn": remove_btn}
+        self._groupingLevelRows.append(row)
+
+        add_btn.clicked.connect(self._addGroupingLevelRow)
+        remove_btn.clicked.connect(lambda checked=False, w=row_widget: self._removeGroupingLevelRow(w))
+        combo.currentIndexChanged.connect(self._onExpGroupingColumnChanged)
+
+        self._onExpGroupingColumnChanged()
+
+    def _removeGroupingLevelRow(self, row_widget):
+        """Remove the given grouping-level row along with any deeper (nested) rows below it,
+        since those levels are no longer meaningful without their parent level."""
+        idx = next((i for i, r in enumerate(self._groupingLevelRows) if r["widget"] is row_widget), None)
+        if idx is None:
+            return
+        for row in self._groupingLevelRows[idx:]:
+            self.ui.expGroupingLevelsContainer_layout.removeWidget(row["widget"])
+            row["widget"].deleteLater()
+        del self._groupingLevelRows[idx:]
+
+        self._onExpGroupingColumnChanged()
+
+    def _currentGroupingColumns(self, group_results_df=None):
+        """Return the ordered list of data-matrix columns currently selected for grouping
+        (one per nesting level), filtered to columns that actually exist in the table."""
+        cols = [self.ui.comboBox_expGroupingColumn.currentText()]
+        for row in getattr(self, "_groupingLevelRows", []):
+            c = row["combo"].currentText()
+            if c:
+                cols.append(c)
+        if group_results_df is not None:
+            cols = [c for c in cols if c in group_results_df.columns]
+        return cols
+
+    def _onExpGroupingColumnChanged(self, *args):
+        """Rebuild the experiment-results tree using the newly selected grouping column(s)."""
+        if not hasattr(self, "experimentResults") or self.experimentResults is None or self.experimentResults.db_con is None:
+            return
+        selected_table = getattr(self.experimentResults, "selected_table", None)
+        if selected_table is None or selected_table not in self.experimentResults.db_con.tables:
+            return
+        group_results_df = self.experimentResults.db_con.tables[selected_table]
+        self._buildExperimentResultsTree(group_results_df, selected_table)
+
+    def _buildExperimentResultsTree(self, group_results_df, selected_table):
+        """(Re-)build the experiment-results tree, nesting features by the column(s) selected in
+        comboBox_expGroupingColumn and any additional grouping-level rows (default: "OGroup"
+        only). Features with an empty value in a grouping column are each placed in their own
+        single-feature group at that level."""
+        experimentalGroups = self.getAllSampleGroups()
+
+        group_cols = self._currentGroupingColumns(group_results_df)
+        if not group_cols:
+            group_cols = ["OGroup"] if "OGroup" in group_results_df.columns else ([group_results_df.columns[0]] if group_results_df.columns else ["OGroup"])
+
+        self.ui.resultsExperiment_TreeWidget.clear()
+        self.ui.resultsExperiment_TreeWidget.setHeaderLabels([" / ".join(group_cols), "MZ", "RT", "Xn", "Z", "IonMode", "MS2 N/L"])
+
+        try:
+            rows = group_results_df.to_dicts()
+
+            def _cell_is_empty(v):
+                return v is None or (isinstance(v, str) and v.strip() == "")
+
+            # Effective group-id path per feature: one id per grouping level, using the
+            # column value or (if that cell is empty) a per-feature singleton at that level.
+            group_path_by_num = {}
+            group_titles = {}  # path prefix (tuple) -> title of that group node
+            group_rt_values = {}  # path prefix (tuple) -> list of RT values of all descendant features
+            for row_dict in rows:
+                num = row_dict["Num"]
+                path = []
+                for col in group_cols:
+                    raw_val = row_dict.get(col)
+                    if _cell_is_empty(raw_val):
+                        gid = f"__single__{col}__{num}"
+                        title = f"(no {col}) {num}"
+                    else:
+                        gid = str(raw_val)
+                        title = gid
+                    path.append(gid)
+                    prefix = tuple(path)
+                    group_titles[prefix] = title
+                    group_rt_values.setdefault(prefix, []).append(row_dict.get("RT"))
+                group_path_by_num[num] = tuple(path)
+
+            def _prefix_mean_rt(prefix):
+                vals = [v for v in group_rt_values[prefix] if v is not None]
+                return mean(vals) if vals else 0.0
+
+            # Build the group-node hierarchy level by level so parent nodes exist before children.
+            all_prefixes = set()
+            for path in group_path_by_num.values():
+                for n in range(1, len(path) + 1):
+                    all_prefixes.add(path[:n])
+
+            metaboliteGroupTreeItems = {}
+            for level in range(1, len(group_cols) + 1):
+                level_prefixes = sorted((p for p in all_prefixes if len(p) == level), key=_prefix_mean_rt)
+                for prefix in level_prefixes:
+                    metaboliteGroup = Bunch(type="metaboliteGroup", metaboliteGroupID=prefix[-1], groupPath=prefix)
+                    metaboliteGroupTreeItem = QtWidgets.QTreeWidgetItem([group_titles[prefix]])
+                    metaboliteGroupTreeItem.bunchData = metaboliteGroup
+                    if level == 1:
+                        self.ui.resultsExperiment_TreeWidget.addTopLevelItem(metaboliteGroupTreeItem)
+                    else:
+                        metaboliteGroupTreeItems[prefix[:-1]].addChild(metaboliteGroupTreeItem)
+                    metaboliteGroupTreeItems[prefix] = metaboliteGroupTreeItem
+            kids = []
+
+            # Build max-normalized abundance ratios per (deepest-level) group:
+            # ratio = Average_peakarea / group max.
+            exp_ratio_by_num = {}
+            if "Average_peakarea" in group_results_df.columns:
+                avg_area_by_num = {row["Num"]: row.get("Average_peakarea") for row in rows}
+                grp_max = {}
+                for num, path in group_path_by_num.items():
+                    aa = avg_area_by_num.get(num)
+                    if aa is not None:
+                        grp_max[path] = max(grp_max.get(path, float("-inf")), float(aa))
+                for num, path in group_path_by_num.items():
+                    aa = avg_area_by_num.get(num)
+                    gmax = grp_max.get(path)
+                    if aa is not None and gmax is not None and gmax > 0:
+                        exp_ratio_by_num[num] = float(aa) / gmax
+            elif "Relative_peakarea_in_group" in group_results_df.columns:
+                # Fallback only when average peak area is unavailable.
+                exp_ratio_by_num = {row["Num"]: float(row["Relative_peakarea_in_group"]) for row in rows if row.get("Relative_peakarea_in_group") is not None}
+
+            # Precompute the list of sample (file) base names present in this result table
+            # (derived from the per-sample "<sample>_Found" columns) and a lookup from
+            # sample name -> defined-group color, used to build the per-sample child rows below.
+            sample_names_in_table = sorted(col[: -len("_Found")] for col in group_results_df.columns if col.endswith("_Found"))
+            sample_color_lookup = {}
+            for sampleGroup in experimentalGroups:
+                for sample_name in self._sampleNamesForGroup(sampleGroup):
+                    sample_color_lookup.setdefault(sample_name, sampleGroup.color)
+
+            for row_dict in rows:
+                # Count N_found_Samples from per-file _Found columns or use pre-computed value
+                n_found_samples = row_dict.get("N_found_Samples")
+                if n_found_samples is None:
+                    n_found_samples = 0
+                    for col_name in row_dict.keys():
+                        if col_name.endswith("_Found") and row_dict[col_name] is not None:
+                            found_val = str(row_dict[col_name])
+                            if "Direct" in found_val or "Reintegrated" in found_val:
+                                n_found_samples += 1
+
+                fp = Bunch(
+                    type="featurePair",
+                    id=row_dict["Num"],
+                    metaboliteGroupID=group_path_by_num[row_dict["Num"]][-1],
+                    groupPath=group_path_by_num[row_dict["Num"]],
+                    mz=row_dict["MZ"],
+                    lmz=row_dict.get("L_MZ"),
+                    dmz=row_dict.get("D_MZ"),
+                    rt=row_dict["RT"] * 60.0,
+                    xn=row_dict["Xn"],
+                    charge=row_dict["Charge"],
+                    scanEvent=row_dict.get("ScanEvent"),
+                    ionisationMode=row_dict.get("Ionisation_Mode"),
+                    tracer=row_dict.get("Tracer"),
+                    N_found_Samples=n_found_samples,
+                )
+
+                title = "%s" % (str(fp.id))
+                try:
+                    title = "%s / %d rep." % (title, int(fp.N_found_Samples))
+                except Exception:
+                    pass
+                try:
+                    rel_ratio = exp_ratio_by_num.get(fp.id)
+                    if rel_ratio is not None:
+                        title = "%s / %.1f%%" % (title, rel_ratio * 100.0)
+                except Exception:
+                    pass
+                try:
+                    title = "%s / %.4g" % (title, row_dict.get("Average_peakarea", -1))
+                except Exception:
+                    pass
+                try:
+                    title = "%s / %s" % (title, row_dict.get("Ion", ""))
+                except Exception:
+                    pass
+
+                featurePair = QtWidgets.QTreeWidgetItem(
+                    [
+                        title,
+                        "%.4f" % fp.mz,
+                        "%.2f" % (fp.rt / 60.0),
+                        str(fp.xn),
+                        str(fp.charge),
+                        str(fp.ionisationMode),
+                        "",
+                    ]
+                )
+                featurePair.bunchData = fp
+
+                # Add a child row per sample where the feature (native and/or
+                # labeled form) was detected, either directly or by re-integration.
+                for sample_name in sample_names_in_table:
+                    found_val = row_dict.get(sample_name + "_Found")
+                    if found_val is None:
+                        continue
+                    detect_type = str(found_val).split(";")[0]
+
+                    area_n = self._parseAreaCellValue(row_dict.get(sample_name + "_Area_N"))
+                    area_l = self._parseAreaCellValue(row_dict.get(sample_name + "_Area_L"))
+
+                    if area_n is not None and area_l is not None:
+                        form_label = "N/L"
+                    elif area_n is not None:
+                        form_label = "N"
+                    elif area_l is not None:
+                        form_label = "L"
+                    else:
+                        form_label = ""
+
+                    sampleNode = QtWidgets.QTreeWidgetItem(
+                        [
+                            sample_name,
+                            detect_type,
+                            form_label,
+                            "%.4g" % area_n if area_n is not None else "",
+                            "%.4g" % area_l if area_l is not None else "",
+                        ]
+                    )
+                    sampleNode.bunchData = Bunch(
+                        type="sampleResult",
+                        sampleName=sample_name,
+                        foundType=detect_type,
+                        form=form_label,
+                        areaN=area_n,
+                        areaL=area_l,
+                    )
+
+                    color = sample_color_lookup.get(sample_name)
+                    if color is not None:
+                        for col in range(5):
+                            sampleNode.setBackground(col, QColor(color))
+
+                    featurePair.addChild(sampleNode)
+
+                kids.append((featurePair, -1, fp.groupPath))
+
+            # Build a lookup {Num -> relative_ratio} for the bar delegate.
+            # Reuse the same max-normalized lookup for delegate bars.
+            _exp_bar_ratio = exp_ratio_by_num
+
+            for fg in set([k[2] for k in kids]):
+                ckids = sorted(
+                    [k for k in kids if k[2] == fg],
+                    key=lambda x: x[1],
+                    reverse=True,
+                )
+                for kid in ckids:
+                    ratio = _exp_bar_ratio.get(kid[0].bunchData.id)
+                    if ratio is not None:
+                        kid[0].setData(0, _RELATIVE_BAR_ROLE, float(ratio))
+                    metaboliteGroupTreeItems[kid[2]].addChild(kid[0])
+
+            # Set the feature-count/mean-RT columns on every group node (any nesting level),
+            # using the RT values of all descendant features collected above.
+            for prefix, treeItem in metaboliteGroupTreeItems.items():
+                rt_vals = [v for v in group_rt_values[prefix] if v is not None]
+                treeItem.setText(1, "%d" % len(group_rt_values[prefix]))
+                if rt_vals:
+                    treeItem.setText(2, "%.2f" % mean(rt_vals))
+
+            # Load data into Statistics tab
+            self._loadStatisticsData(from_sheet=selected_table)
+
+        except Exception as e:
+            traceback.print_exc()
+            logging.error(str(traceback))
+
+            logging.error("Experiment results tree could not be built correctly: " + str(e))
 
     def closeLoadedGroupsResultsFile(self):
         if hasattr(self, "experimentResults"):
@@ -3517,6 +3671,8 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         except Exception:
             abs_intens_threshold = 0.0
 
+        filter_regex = self._get_msms_show_filter_regex()
+
         file_keys = [k for k in self.loadedMZXMLs if k.lower().endswith(".mzxml") or k.lower().endswith(".mzml")]
 
         # Collect all features from the tree
@@ -3592,6 +3748,10 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                         form = "labeled"
 
                     if form is None:
+                        continue
+
+                    # Check filter-string regex (Show options)
+                    if not self._msms_filter_match(self._get_msms_filter_string(ms2_scan), filter_regex)[0]:
                         continue
 
                     # Check percent threshold if applicable
@@ -3745,6 +3905,17 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         feature_group_sample_areas = {}
         all_labels = set()
         label_side_votes = {}  # label -> {"native": n, "labeled": n}
+
+        plot_mode = self.ui.comboBox_isotopicPatternPlotType.currentIndex()
+        chart_type = plot_mode % 3  # 0=boxplot, 1=scatterplot, 2=line plot
+        norm_mode = plot_mode // 3  # 0=normalize by area, 1=normalize to max, 2=raw (no normalization)
+        norm_funcs = {
+            0: self._normalizeIsotopicPattern,
+            1: self._normalizeIsotopicPatternToMax,
+            2: self._rawIsotopicPattern,
+        }
+        norm_func = norm_funcs.get(norm_mode, self._normalizeIsotopicPattern)
+
         for feature_id in sorted(set(selected_ids)):
             row = rows_by_num.get(feature_id)
             if row is None:
@@ -3778,7 +3949,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                     areas_by_pos = {p: a for p, a in areas_by_pos.items() if 0 <= p <= xcount}
                     if not areas_by_pos:
                         continue
-                    normalized_by_pos, native_positions, labeled_positions = self._normalizeIsotopicPattern(areas_by_pos, xcount)
+                    normalized_by_pos, native_positions, labeled_positions = norm_func(areas_by_pos, xcount)
                     sample_areas = {isotopologLabel(p, xcount): v for p, v in normalized_by_pos.items()}
                     for pos in native_positions:
                         label = isotopologLabel(pos, xcount)
@@ -3800,8 +3971,18 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         )
         labels = sorted(all_labels, key=_isotopolog_sort_key)
 
-        ax.set_title("Isotopolog pattern of selected features (native/labeled sides normalized separately)")
-        ax.set_ylabel("Normalized fraction (of native or labeled side)")
+        title_by_norm_mode = {
+            0: "Isotopolog pattern of selected features (native/labeled sides normalized separately by area under pattern)",
+            1: "Isotopolog pattern of selected features (native/labeled sides normalized to max. isotopolog)",
+            2: "Isotopolog pattern of selected features (raw peak areas)",
+        }
+        ylabel_by_norm_mode = {
+            0: "Normalized fraction (of native or labeled side)",
+            1: "Fraction relative to most abundant isotopolog (per side)",
+            2: "Peak area (raw)",
+        }
+        ax.set_title(title_by_norm_mode.get(norm_mode, title_by_norm_mode[0]))
+        ax.set_ylabel(ylabel_by_norm_mode.get(norm_mode, ylabel_by_norm_mode[0]))
         ax.set_xlabel("Isotopolog")
 
         # label -> group_name -> feature_id -> {sample_name: value}
@@ -3811,8 +3992,6 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 for sample_name, sample_areas in sample_areas_map.items():
                     for label, value in sample_areas.items():
                         entries.setdefault(label, {}).setdefault(group_name, {}).setdefault(feature_id, {})[sample_name] = value
-
-        plot_mode = self.ui.comboBox_isotopicPatternPlotType.currentIndex()
 
         any_data = False
         if feature_ids and group_names and labels:
@@ -3844,7 +4023,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                         vals = list(sample_map.values())
                         any_data = True
 
-                        if plot_mode == 0:
+                        if chart_type == 0:
                             box_data.append(vals)
                             positions.append(pos)
                             box_colors.append(gcolor)
@@ -3855,7 +4034,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                                 scatter_x.append(pos + jitter)
                                 scatter_y.append(value)
                                 scatter_colors.append(gcolor)
-                        elif plot_mode == 1:
+                        elif chart_type == 1:
                             n_vals = len(vals)
                             for j, value in enumerate(vals):
                                 jitter = (j / (n_vals - 1) - 0.5) * box_width * 0.6 if n_vals > 1 else 0.0
@@ -3867,7 +4046,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                                 sample_lines.setdefault((group_name, feature_id, sample_name), []).append((pos, value))
 
             if any_data:
-                if plot_mode == 0:
+                if chart_type == 0:
                     bp = ax.boxplot(box_data, positions=positions, widths=box_width, patch_artist=True, showfliers=False)
                     for patch, c in zip(bp["boxes"], box_colors):
                         patch.set_facecolor(c)
@@ -3878,7 +4057,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                         xs, ys = zip(*pts)
                         gcolor = group_color_map.get(group_name, "gray")
                         ax.plot(xs, ys, color=gcolor, alpha=0.5, linewidth=1.2, zorder=2)
-                elif plot_mode == 1:
+                elif chart_type == 1:
                     ax.scatter(scatter_x, scatter_y, c=scatter_colors, s=24, edgecolors="black", linewidths=0.4, alpha=0.85, zorder=3)
                 else:
                     for (group_name, feature_id, sample_name), pts in sample_lines.items():
@@ -4634,11 +4813,10 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                         entry.setdefault("polarity_key", None)
                         # Ensure entry has a type based on path if missing
                         if "type" not in entry or not entry.get("type"):
-                            p = entry.get("path", "")
-                            entry["type"] = "json" if str(p).lower().endswith(".json") else "mgf"
+                            entry["type"] = self._guess_msms_library_file_type(entry.get("path", ""))
                     else:
                         # Legacy format: plain MGF file path string
-                        entry = {"path": mgfEntry, "type": ("json" if str(mgfEntry).lower().endswith(".json") else "mgf"), "precursor_mz_key": None, "polarity_key": None}
+                        entry = {"path": mgfEntry, "type": self._guess_msms_library_file_type(mgfEntry), "precursor_mz_key": None, "polarity_key": None}
                     # Try to discover properties / count spectra for nicer display
                     try:
                         from .MSMS import mgfLibrary
@@ -7041,7 +7219,8 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                             l_end_rt = xp.LPeakCenterMin + xp.LPeakScale
                         rt_min = min(float(n_start_rt), float(l_start_rt))
                         rt_max = max(float(n_end_rt), float(l_end_rt))
-                        has_msms = self.hasMSMSSpectra(xp.mz, rt_min, rt_max, ppm) or self.hasMSMSSpectra(xp.lmz, rt_min, rt_max, ppm)
+                        msms_filter_regex = self._get_msms_show_filter_regex()
+                        has_msms = self.hasMSMSSpectra(xp.mz, rt_min, rt_max, ppm, msms_filter_regex) or self.hasMSMSSpectra(xp.lmz, rt_min, rt_max, ppm, msms_filter_regex)
                         msms_marker = "* " if has_msms else ""
 
                         d = QtWidgets.QTreeWidgetItem(
@@ -7231,7 +7410,8 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                                 rt_max = xp.NPeakCenterMin + xp.NPeakScale
                                 rt_min = min(rt_min, xp.LPeakCenterMin - xp.LPeakScale)
                                 rt_max = max(rt_max, xp.LPeakCenterMin + xp.LPeakScale)
-                                has_msms = self.hasMSMSSpectra(xp.mz, rt_min, rt_max, ppm) or self.hasMSMSSpectra(xp.lmz, rt_min, rt_max, ppm)
+                                msms_filter_regex = self._get_msms_show_filter_regex()
+                                has_msms = self.hasMSMSSpectra(xp.mz, rt_min, rt_max, ppm, msms_filter_regex) or self.hasMSMSSpectra(xp.lmz, rt_min, rt_max, ppm, msms_filter_regex)
                                 msms_marker = "* " if has_msms else ""
 
                                 # Track if any feature in this group has MSMS
@@ -9570,6 +9750,8 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                         cb = self.ui.pl2B.fig.colorbar(cbx, ticks=[0, 0.1, 0.2, maxSilRatioCurrent])
                         cb.outline.set_linewidth(0)
 
+                        self.ui.pl2A.fig.tight_layout()
+                        self.ui.pl2B.fig.tight_layout()
                         self.ui.pl2A.fig.canvas.draw()
                         self.ui.pl2B.fig.canvas.draw()
 
@@ -10550,8 +10732,20 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
     # </editor-fold>
 
     # <editor-fold desc="### MSMS spectrum functions">
-    def hasMSMSSpectra(self, mz, rt_min, rt_max, ppm=5.0):
-        """Check if MSMS spectra exist for a given m/z and RT range"""
+    def _get_msms_show_filter_regex(self):
+        """Return the compiled MS/MS "Show options" filter-string regex, or None."""
+        try:
+            pattern = str(self.ui.lineEdit_msms_filter_regex.text()).strip()
+        except Exception:
+            pattern = ""
+        return self._compile_msms_filter_regex(pattern)
+
+    def hasMSMSSpectra(self, mz, rt_min, rt_max, ppm=5.0, filter_regex=None):
+        """Check if MSMS spectra exist for a given m/z and RT range.
+
+        Also matches each candidate scan's filter string against ``filter_regex``
+        (the compiled MS/MS "Show options" filter-string regex), so the MS/MS
+        indicator ('*') reflects the same spectra that are actually shown/used."""
         if not hasattr(self, "currentOpenRawFile") or self.currentOpenRawFile is None:
             return False
 
@@ -10566,7 +10760,9 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         for ms2_scan in self.currentOpenRawFile.MS2_list:
             if rt_min <= ms2_scan.retention_time <= rt_max:
                 if mz_min <= ms2_scan.precursor_mz <= mz_max:
-                    return True
+                    filter_string = self._get_msms_filter_string(ms2_scan)
+                    if self._msms_filter_match(filter_string, filter_regex)[0]:
+                        return True
 
         return False
 
@@ -14478,6 +14674,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 if handles and labels:
                     ax.legend()
 
+        plt.fig.tight_layout()
         plt.canvas.draw()
 
     # </editor-fold>
@@ -14692,6 +14889,10 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                     allShow = allShow or show
                 fg.setHidden(not allShow)
 
+    def _onExpToolsSectionToggle(self, checked):
+        self.ui.expToolsButtonsWidget.setVisible(checked)
+        self.ui.expToolsSectionToggleBtn.setText("Hide tools \u25b4" if checked else "Show tools \u25be")
+
     def _onExpFilterToggle(self, checked):
         self.ui.expFilterContent.setVisible(checked)
         self.ui.expFilterToggleBtn.setText("Hide filters \u25b4" if checked else "Show filters \u25be")
@@ -14816,107 +15017,125 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 selected_table = getattr(self.experimentResults, "selected_table", None)
                 if selected_table is not None and selected_table in self.experimentResults.db_con.tables:
                     all_ids = []
-                    for i in range(tree.topLevelItemCount()):
-                        top = tree.topLevelItem(i)
-                        for c in range(top.childCount()):
-                            bd = getattr(top.child(c), "bunchData", None)
-                            fid = getattr(bd, "id", None) if bd is not None else None
+
+                    def _collect_feature_ids(item):
+                        bd = getattr(item, "bunchData", None)
+                        if bd is not None and getattr(bd, "type", None) == "featurePair":
+                            fid = getattr(bd, "id", None)
                             if fid is not None:
                                 all_ids.append(fid)
+                        for c in range(item.childCount()):
+                            _collect_feature_ids(item.child(c))
+
+                    for i in range(tree.topLevelItemCount()):
+                        _collect_feature_ids(tree.topLevelItem(i))
                     if all_ids:
                         table_df = self.experimentResults.db_con.tables[selected_table]
                         group_filter_rows_by_num = {row["Num"]: row for row in table_df.filter(pl.col("Num").is_in(all_ids)).to_dicts()}
 
-        for i in range(tree.topLevelItemCount()):
-            top = tree.topLevelItem(i)
-            if no_filters:
-                top.setHidden(False)
-                for c in range(top.childCount()):
-                    top.child(c).setHidden(False)
-                continue
+        def _feature_matches(bd):
+            """Evaluate all active filters against a single feature (bunchData with type == 'featurePair')."""
+            show = True
 
+            # m/z filter
+            if mz_text and show:
+                mz_val = getattr(bd, "mz", None)
+                if mz_val is not None:
+                    mz_str = "%.4f" % mz_val
+                    if mz_min is not None and mz_max is not None:
+                        show = mz_min <= mz_val <= mz_max
+                    elif mz_sub:
+                        show = mz_sub in mz_str
+
+            # RT filter
+            if rt_text and show:
+                rt_val = getattr(bd, "rt", None)
+                if rt_val is not None:
+                    rt_min_val = rt_val / 60.0
+                    rt_str = "%.2f" % rt_min_val
+                    if rt_min is not None and rt_max is not None:
+                        show = rt_min <= rt_min_val <= rt_max
+                    elif rt_sub:
+                        show = rt_sub in rt_str
+
+            # Xn filter
+            if xn_text and show:
+                xn_val = getattr(bd, "xn", None)
+                if xn_val is not None:
+                    xn_str = str(xn_val)
+                    if xn_min is not None and xn_max is not None:
+                        try:
+                            show = xn_min <= float(xn_val) <= xn_max
+                        except (TypeError, ValueError):
+                            show = False
+                    elif xn_sub:
+                        show = xn_sub in xn_str
+
+            # Z (charge state) filter
+            if z_text and show:
+                z_val = getattr(bd, "charge", None)
+                if z_val is not None:
+                    show = z_text in str(z_val)
+
+            # Polarity filter
+            if polarity_idx != 0 and show:
+                ion_mode = str(getattr(bd, "ionisationMode", "") or "")
+                if polarity_idx == 1:
+                    show = "+" in ion_mode
+                elif polarity_idx == 2:
+                    show = "-" in ion_mode
+
+            # MS2 filter
+            if ms2_idx != 0 and show:
+                feature_num = getattr(bd, "id", None)
+                forms = msms_forms.get(feature_num, set())
+                if ms2_idx == 1:
+                    show = len(forms) == 0
+                elif ms2_idx == 2:
+                    show = len(forms) > 0
+                elif ms2_idx == 3:
+                    show = "native" in forms
+                elif ms2_idx == 4:
+                    show = "labeled" in forms
+
+            # Group-presence filter, e.g. "GroupA:N > 3 AND GroupB:L <= 2"
+            if parsed_group_filter is not None and show:
+                row = group_filter_rows_by_num.get(getattr(bd, "id", None))
+                show = row is not None and self._eval_group_presence_filter(row, parsed_group_filter, group_sample_names)
+
+            return show
+
+        def _apply_filter(item):
+            """Recursively apply the filter to `item` and its descendants.
+
+            Returns True if `item` (or any of its descendants) should remain visible.
+            Feature nodes ("featurePair") are evaluated directly against the active
+            filters; group nodes are shown only if at least one of their children
+            (at any depth) matches, so nested grouping levels are handled correctly.
+            """
+            bd = getattr(item, "bunchData", None)
+
+            if bd is not None and getattr(bd, "type", None) == "featurePair":
+                show = True if no_filters else _feature_matches(bd)
+                item.setHidden(not show)
+                return show
+
+            # Group node (or a node without recognizable bunchData, e.g. sample rows):
+            # visible if any child remains visible after filtering.
             any_child_shown = False
-            for c in range(top.childCount()):
-                child = top.child(c)
-                bd = getattr(child, "bunchData", None)
-                if bd is None:
-                    child.setHidden(False)
-                    any_child_shown = True
-                    continue
-
-                show = True
-
-                # m/z filter
-                if mz_text and show:
-                    mz_val = getattr(bd, "mz", None)
-                    if mz_val is not None:
-                        mz_str = "%.4f" % mz_val
-                        if mz_min is not None and mz_max is not None:
-                            show = mz_min <= mz_val <= mz_max
-                        elif mz_sub:
-                            show = mz_sub in mz_str
-
-                # RT filter
-                if rt_text and show:
-                    rt_val = getattr(bd, "rt", None)
-                    if rt_val is not None:
-                        rt_min_val = rt_val / 60.0
-                        rt_str = "%.2f" % rt_min_val
-                        if rt_min is not None and rt_max is not None:
-                            show = rt_min <= rt_min_val <= rt_max
-                        elif rt_sub:
-                            show = rt_sub in rt_str
-
-                # Xn filter
-                if xn_text and show:
-                    xn_val = getattr(bd, "xn", None)
-                    if xn_val is not None:
-                        xn_str = str(xn_val)
-                        if xn_min is not None and xn_max is not None:
-                            try:
-                                show = xn_min <= float(xn_val) <= xn_max
-                            except (TypeError, ValueError):
-                                show = False
-                        elif xn_sub:
-                            show = xn_sub in xn_str
-
-                # Z (charge state) filter
-                if z_text and show:
-                    z_val = getattr(bd, "charge", None)
-                    if z_val is not None:
-                        show = z_text in str(z_val)
-
-                # Polarity filter
-                if polarity_idx != 0 and show:
-                    ion_mode = str(getattr(bd, "ionisationMode", "") or "")
-                    if polarity_idx == 1:
-                        show = "+" in ion_mode
-                    elif polarity_idx == 2:
-                        show = "-" in ion_mode
-
-                # MS2 filter
-                if ms2_idx != 0 and show:
-                    feature_num = getattr(bd, "id", None)
-                    forms = msms_forms.get(feature_num, set())
-                    if ms2_idx == 1:
-                        show = len(forms) == 0
-                    elif ms2_idx == 2:
-                        show = len(forms) > 0
-                    elif ms2_idx == 3:
-                        show = "native" in forms
-                    elif ms2_idx == 4:
-                        show = "labeled" in forms
-
-                # Group-presence filter, e.g. "GroupA:N > 3 AND GroupB:L <= 2"
-                if parsed_group_filter is not None and show:
-                    row = group_filter_rows_by_num.get(getattr(bd, "id", None))
-                    show = row is not None and self._eval_group_presence_filter(row, parsed_group_filter, group_sample_names)
-
-                child.setHidden(not show)
-                if show:
+            for c in range(item.childCount()):
+                if _apply_filter(item.child(c)):
                     any_child_shown = True
 
-            top.setHidden(not any_child_shown)
+            if item.childCount() == 0:
+                # Leaf node without bunchData (shouldn't normally happen for groups).
+                any_child_shown = True
+
+            item.setHidden(not any_child_shown)
+            return any_child_shown
+
+        for i in range(tree.topLevelItemCount()):
+            _apply_filter(tree.topLevelItem(i))
 
         # Sync feature map if it is open
         if self.ui.expFeatureMapContainer.isVisible():
@@ -14997,17 +15216,16 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             return {}
 
     @staticmethod
-    def _normalizeIsotopicPattern(sample_areas_by_pos, xcount):
+    def _splitNativeLabeledPositions(sample_areas_by_pos, xcount):
         """Split an isotopolog area pattern (position 0..xcount, i.e. M..M') into a native
-        (M-side) and labeled (M'-side) part and normalize each part to sum to 1. The border
-        between the two parts is the isotopolog closest to M that is undetected (zero), or
-        otherwise the least abundant detected isotopolog among the internal (non-M/M')
-        positions.
+        (M-side) and labeled (M'-side) part. The border between the two parts is the
+        isotopolog closest to M that is undetected (zero), or otherwise the least abundant
+        detected isotopolog among the internal (non-M/M') positions.
 
         sample_areas_by_pos is keyed by integer isotopolog position (0=M, xcount=M').
 
-        Returns a tuple (normalized_areas_by_pos, native_positions, labeled_positions) where
-        the latter two list which integer positions were assigned to the native/labeled side.
+        Returns a tuple (native_positions, labeled_positions) listing which integer
+        positions were assigned to the native/labeled side.
         """
         positions = list(range(0, xcount + 1))
         values = [sample_areas_by_pos.get(p, 0.0) for p in positions]
@@ -15021,15 +15239,60 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
         native_positions = [p for p in positions if p <= border]
         labeled_positions = [p for p in positions if p > border]
-        native_sum = sum(values[p] for p in native_positions)
-        labeled_sum = sum(values[p] for p in labeled_positions)
+        return native_positions, labeled_positions
+
+    @staticmethod
+    def _normalizeIsotopicPattern(sample_areas_by_pos, xcount):
+        """Split an isotopolog area pattern (position 0..xcount, i.e. M..M') into a native
+        (M-side) and labeled (M'-side) part and normalize each part to sum to 1 (i.e.
+        normalize by the area under the pattern).
+
+        sample_areas_by_pos is keyed by integer isotopolog position (0=M, xcount=M').
+
+        Returns a tuple (normalized_areas_by_pos, native_positions, labeled_positions) where
+        the latter two list which integer positions were assigned to the native/labeled side.
+        """
+        native_positions, labeled_positions = mainWindow._splitNativeLabeledPositions(sample_areas_by_pos, xcount)
+        values = sample_areas_by_pos
+        native_sum = sum(values.get(p, 0.0) for p in native_positions)
+        labeled_sum = sum(values.get(p, 0.0) for p in labeled_positions)
 
         normalized = {}
         for p in native_positions:
-            normalized[p] = (values[p] / native_sum) if native_sum > 0 else 0.0
+            normalized[p] = (values.get(p, 0.0) / native_sum) if native_sum > 0 else 0.0
         for p in labeled_positions:
-            normalized[p] = (values[p] / labeled_sum) if labeled_sum > 0 else 0.0
+            normalized[p] = (values.get(p, 0.0) / labeled_sum) if labeled_sum > 0 else 0.0
         return normalized, native_positions, labeled_positions
+
+    @staticmethod
+    def _normalizeIsotopicPatternToMax(sample_areas_by_pos, xcount):
+        """Same split as `_normalizeIsotopicPattern`, but each side is normalized to its own
+        most abundant (max) isotopolog signal instead of to the area under the pattern.
+
+        Returns a tuple (normalized_areas_by_pos, native_positions, labeled_positions).
+        """
+        native_positions, labeled_positions = mainWindow._splitNativeLabeledPositions(sample_areas_by_pos, xcount)
+        values = sample_areas_by_pos
+        native_max = max((values.get(p, 0.0) for p in native_positions), default=0.0)
+        labeled_max = max((values.get(p, 0.0) for p in labeled_positions), default=0.0)
+
+        normalized = {}
+        for p in native_positions:
+            normalized[p] = (values.get(p, 0.0) / native_max) if native_max > 0 else 0.0
+        for p in labeled_positions:
+            normalized[p] = (values.get(p, 0.0) / labeled_max) if labeled_max > 0 else 0.0
+        return normalized, native_positions, labeled_positions
+
+    @staticmethod
+    def _rawIsotopicPattern(sample_areas_by_pos, xcount):
+        """No normalization: return the raw peak areas unchanged, split into native/labeled
+        sides purely for the purpose of drawing the native/labeled separator line.
+
+        Returns a tuple (areas_by_pos, native_positions, labeled_positions).
+        """
+        native_positions, labeled_positions = mainWindow._splitNativeLabeledPositions(sample_areas_by_pos, xcount)
+        raw = {p: sample_areas_by_pos.get(p, 0.0) for p in native_positions + labeled_positions}
+        return raw, native_positions, labeled_positions
 
     @staticmethod
     def _compareGroupFilterOp(count, op, val):
@@ -15448,6 +15711,44 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                         QtWidgets.QMessageBox.Ok,
                     )
 
+    def _ask_msms_import_filter_options(self):
+        """Ask the user for the MS/MS filter-string regex and import scope to use while
+        loading raw LC-HRMS files. Returns (pattern, mode) where mode is "matching"
+        (discard non-matching MS2 spectra at import time) or "all" (import every MS2
+        spectrum, but keep the "Show options" filter in sync). Returns (None, None)
+        if the user cancels the dialog."""
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("MS/MS filter string")
+        form = QtWidgets.QFormLayout(dlg)
+
+        info = QtWidgets.QLabel("MS/MS spectra are matched against a regular expression applied to each scan's filter string (cvParam MS:1000512). This is the same filter used in the experiment's MS/MS \"Show options\".")
+        info.setWordWrap(True)
+        form.addRow(info)
+
+        regex_edit = QtWidgets.QLineEdit(str(self.ui.lineEdit_msms_filter_regex.text()))
+        regex_edit.setClearButtonEnabled(True)
+        regex_edit.setPlaceholderText("e.g. hcd(\\d+\\.\\d+)")
+        form.addRow("Filter string regex:", regex_edit)
+
+        mode_all = QtWidgets.QRadioButton("Import all MS/MS spectra")
+        mode_filtered = QtWidgets.QRadioButton("Import only MS/MS spectra matching the filter string")
+        mode_all.setChecked(True)
+        mode_group = QtWidgets.QButtonGroup(dlg)
+        mode_group.addButton(mode_all)
+        mode_group.addButton(mode_filtered)
+        form.addRow(mode_all)
+        form.addRow(mode_filtered)
+
+        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        form.addRow(btns)
+
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return None, None
+
+        return str(regex_edit.text()).strip(), ("matching" if mode_filtered.isChecked() else "all")
+
     def loadAllSamples(self, selectedMZs=None, ppm=25.0):
         from .utilities import RunImapUnordered
 
@@ -15463,6 +15764,11 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             )[0]
         )
 
+        msmsFilterRegexPattern, msmsImportMode = self._ask_msms_import_filter_options()
+        if msmsImportMode is None:
+            return
+        self.ui.lineEdit_msms_filter_regex.setText(msmsFilterRegexPattern)
+
         definedGroups = self.getAllSampleGroups()
         self.loadedMZXMLs = {}
 
@@ -15477,6 +15783,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                         "IntensityThreshold": intensityThreshold,
                         "selectedMZs": selectedMZs,
                         "ppm": ppm,
+                        "MSMSFilterRegex": msmsFilterRegexPattern if msmsImportMode == "matching" else None,
                     }
                 )
 
@@ -16553,6 +16860,18 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
     def addJSON(self, events=None):
         self._add_library_files("json")
 
+    def addMSP(self, events=None):
+        self._add_library_files("msp")
+
+    def _guess_msms_library_file_type(self, path):
+        """Guess an MS/MS spectral library file's type ("json"/"msp"/"mgf") from its extension."""
+        p = str(path).lower()
+        if p.endswith(".json"):
+            return "json"
+        if p.endswith(".msp"):
+            return "msp"
+        return "mgf"
+
     def _add_library_files(self, file_type):
         from .MSMS import mgfLibrary
 
@@ -16561,6 +16880,11 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             file_filter = "JSON spectral library (*.json);;All files (*.*)"
             precursor_guess_candidates = ("precursor_m/z", "precursor_mz", "pepmass")
             polarity_guess_candidates = ("ac$mass_spectrometry_ion_mode",)
+        elif file_type == "msp":
+            caption = "Select MS/MS spectral library file(s) (MSP)"
+            file_filter = "MSP spectral library (*.msp);;All files (*.*)"
+            precursor_guess_candidates = ("precursormz", "precursor_mz", "exactmass")
+            polarity_guess_candidates = ("ion_mode",)
         else:
             caption = "Select MS/MS spectral library file(s) (MGF)"
             file_filter = "MGF spectral library (*.mgf);;All files (*.*)"
@@ -16651,6 +16975,13 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                     "NAME",
                     "SPECTRUMID",
                     "database_identifier",
+                    "PrecursorMZ",
+                    "Precursor_type",
+                    "Ion_mode",
+                    "Collision_energy",
+                    "Formula",
+                    "InChIKey",
+                    "DB#",
                 ]
                 default_keys_lc = {k.lower() for k in default_keys}
                 for p in properties:
@@ -16789,31 +17120,49 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
     def _check_library_polarity_and_confirm(self, library_entries):
         """
-        After loading spectral library file(s) (MGF or JSON), warn the user (once, for all files
-        together) about any spectra for which polarity could not be resolved (no ION_MODE/CHARGE
-        and no recognisable adduct), and ask whether to still use them for matching.
+        After loading spectral library file(s) (MGF/JSON/MSP), inform the user about any spectra
+        missing information required for matching:
+          - no usable precursor m/z and/or no fragment peaks: these spectra are always excluded
+            from matching (informational only, per-file counts are shown)
+          - no recognisable polarity (no ION_MODE/CHARGE field and no recognisable adduct): the
+            user is asked whether to still use the affected library file(s)
         """
         from .MSMS import mgfLibrary
 
         if not library_entries:
             return
 
-        n_missing = 0
+        n_missing_polarity = 0
+        n_missing_precursor = 0
         n_total = 0
+        precursor_missing_by_file = []
         for entry in library_entries:
             try:
                 spectra = mgfLibrary.load_library_entry(entry)
             except Exception as e:
-                logging.error(f"Could not parse library file '{entry['path']}' to check polarity: {e}")
+                logging.error(f"Could not parse library file '{entry['path']}' to check for missing information: {e}")
                 continue
             n_total += len(spectra)
-            n_missing += len(mgfLibrary.spectra_without_polarity(spectra))
+            n_missing_polarity += len(mgfLibrary.spectra_without_polarity(spectra))
+            n_missing_here = len(mgfLibrary.spectra_missing_precursor_mz(spectra))
+            n_missing_precursor += n_missing_here
+            if n_missing_here > 0:
+                precursor_missing_by_file.append((os.path.basename(entry["path"]), n_missing_here, len(spectra)))
 
-        if n_missing > 0:
+        if n_missing_precursor > 0:
+            details = "\n".join(f"  - {name}: {missing} of {total} spectra" for name, missing, total in precursor_missing_by_file)
+            QtWidgets.QMessageBox.information(
+                self,
+                "MetExtract",
+                f"{n_missing_precursor} of {n_total} spectra in the newly added library file(s) are missing a precursor m/z and/or fragment peaks and cannot be used for MS/MS library matching. They are automatically excluded:\n\n{details}",
+                QtWidgets.QMessageBox.Ok,
+            )
+
+        if n_missing_polarity > 0:
             answer = QtWidgets.QMessageBox.question(
                 self,
                 "MetExtract",
-                f"{n_missing} of {n_total} spectra in the newly added library file(s) have no recognisable polarity (ION_MODE/CHARGE field or adduct). They will be skipped during MS/MS library matching.\n\nDo you still want to use these library file(s)?",
+                f"{n_missing_polarity} of {n_total} spectra in the newly added library file(s) have no recognisable polarity (ION_MODE/CHARGE field or adduct). They will be skipped during MS/MS library matching.\n\nDo you still want to use these library file(s)?",
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
             )
             if answer == QtWidgets.QMessageBox.No:
@@ -17491,6 +17840,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.ui.mgfList_listView.setModel(self.mgfListModel)
         self.ui.addMGF_pushButton.clicked.connect(self.addMGF)
         self.ui.addJSON_pushButton.clicked.connect(self.addJSON)
+        self.ui.addMSP_pushButton.clicked.connect(self.addMSP)
         self.ui.showMSMSOverview_pushButton.clicked.connect(self.showMSMSSpectraOverviewDialog)
         self.ui.removeMGF_pushButton.clicked.connect(self.removeMGF)
         self.ui.actionMSMSSpectraOverview.triggered.connect(self.showMSMSSpectraOverviewDialog)
@@ -17786,6 +18136,10 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.ui.expDataFilter.textChanged.connect(self.expFilterEdited)
         # Connect collapsible filter toggle
         self.ui.expFilterToggleBtn.toggled.connect(self._onExpFilterToggle)
+        self.ui.expToolsSectionToggleBtn.toggled.connect(self._onExpToolsSectionToggle)
+        self._groupingLevelRows = []
+        self.ui.comboBox_expGroupingColumn.currentIndexChanged.connect(self._onExpGroupingColumnChanged)
+        self.ui.expAddGroupingLevelBtn.clicked.connect(self._addGroupingLevelRow)
         self.ui.expFilterResetBtn.clicked.connect(self._onExpFilterReset)
         self.ui.expExportMGFBtn.clicked.connect(self._export_exp_msms_mgf)
         self.ui.expFeatureMapBtn.toggled.connect(self._toggleFeatureMap)
@@ -17992,22 +18346,40 @@ def main():
         QtWidgets.QMessageBox.information(
             None,
             "MetExtract",
-            "When you start a new experiment, please <b>change the<br>working directory</b> to your experimental folder.<br>"
-            + "You can set the working directory via the menu<br>('Tools'->'Set working directory').<br>"
-            + "<br>"
-            + "Please also consider <b>copying</b> any databases or<br>other resources to your working directory.<br>"
-            + "<br>"
-            + "To quickly change the values of drop-down and<br>integer/float spinner controls, <b>hold the CTRL-key<br>and use the mouse-wheel</b>.<br>"
-            + "<br>"
-            + f"If importing mzML files results in the error<br>of missing files, please find the correct version at<br><b>{OBO_DOWNLOAD_URL}</b>.<br>"
-            + "Please download the corresponding obo-file and<br>save it to the folder in the error message.<br>"
-            + "You can also open this page via the menu<br>(<b>'Tools'->'Download OBO files'</b>).<br>"
-            + "<br>"
-            + "In the experiment-results MS/MS tab you can <b>filter<br>spectra by their filter string</b> (cvParam MS:1000512)<br>"
-            + "using a regular expression. Leave it empty to show all<br>spectra; a capturing group is shown in the first column.<br>"
-            + "The 'Show filter strings' button lists all loaded filter<br>strings.<br>"
-            + "<br>"
-            + "To generate a template for a database, select<br><b>'Download Database Template'</b> from the 'Tools' menu.",
+            "When you start a new experiment, please <b>change the<br>"
+            + "working directory</b> to your experimental folder.<br>"
+            + "You can set the working directory via the menu<br>"
+            + "('Tools'->'Set working directory')."
+            + "<br><br>"
+            + "Please also consider <b>copying</b> any databases or<br>"
+            + "other resources to your working directory."
+            + "<br><br>"
+            + "To quickly change the values of drop-down and<br>"
+            + "integer/float spinner controls, <b>hold the CTRL-key<br>"
+            + "and use the mouse-wheel</b>."
+            + "<br><br>"
+            + "If importing mzML files results in the error<br>"
+            + "of missing files, please find the correct version at<br>"
+            + f"<b>{OBO_DOWNLOAD_URL}</b>.<br>"
+            + "Please download the corresponding obo-file and<br>"
+            + "save it to the folder in the error message.<br>"
+            + "You can also open this page via the menu<br>"
+            + "(<b>'Tools'->'Download OBO files'</b>)."
+            + "<br><br>"
+            + "In the experiment-results MS/MS tab you can <b>filter<br>"
+            + "spectra by their filter string</b> (cvParam MS:1000512)<br>"
+            + "using a regular expression. Leave it empty to show all<br>"
+            + "spectra; a capturing group is shown in the first column.<br>"
+            + "The 'Show filter strings' button lists all loaded filter<br>"
+            + "strings."
+            + "<br><br>"
+            + "To generate a template for a database, select<br>"
+            + "<b>'Download Database Template'</b> from the 'Tools' menu."
+            + "<br><br>"
+            + "Results XLSX files can be modified. Additional columns<br>"
+            + "(e.g., for user-based grouping) may be used as a grouping<br>"
+            + "factor in the <b>Experimental results</b> (e.g., isotopic<br>"
+            + "pattern clustering, statistically sig. metabolites, etc.).",
             QtWidgets.QMessageBox.Ok,
         )
 

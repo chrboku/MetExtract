@@ -139,6 +139,11 @@ QComboBox QAbstractItemView {
     outline: none;
 }
 
+QComboBox QAbstractItemView::item {
+    padding: 2px 6px;
+    min-height: 18px;
+}
+
 /* -------------------------------------------------------
    Buttons — flat, borderless, Chrome DevTools style
 ------------------------------------------------------- */
