@@ -469,13 +469,20 @@ def loadMZXMLFile(params):
 
 # Custom data role used to store the relative intensity ratio (float 0.0–1.0) on tree items.
 _RELATIVE_BAR_ROLE = QtCore.Qt.ItemDataRole.UserRole + 50
+# Custom data role: bool flag, True when the feature has at least one MS/MS spectrum.
+_RELATIVE_BAR_HAS_MSMS_ROLE = QtCore.Qt.ItemDataRole.UserRole + 51
 
 
 class _RelativeBarDelegate(QtWidgets.QStyledItemDelegate):
-    """Paints a faint green bar filling the left portion of the cell proportional to the stored ratio."""
+    """Paints a bar filling the left portion of the cell proportional to the stored ratio.
+
+    Green by default; dodgerblue instead when the feature has at least one MS/MS spectrum
+    (the leading '*' marker in the feature title is kept regardless of bar color)."""
 
     _COLOR_FILL = QtGui.QColor(80, 180, 80, 120)  # green bar
     _COLOR_BG = QtGui.QColor(200, 240, 200, 50)  # very faint green background tint
+    _COLOR_FILL_MSMS = QtGui.QColor(30, 144, 255, 130)  # dodgerblue bar
+    _COLOR_BG_MSMS = QtGui.QColor(200, 225, 255, 50)  # very faint dodgerblue background tint
 
     def paint(self, painter, option, index):
         super().paint(painter, option, index)
@@ -488,12 +495,15 @@ class _RelativeBarDelegate(QtWidgets.QStyledItemDelegate):
 
         if ratio > 0.0:
             ratio = min(ratio, 1.0)
+            has_msms = bool(index.data(_RELATIVE_BAR_HAS_MSMS_ROLE))
+            fill_color = self._COLOR_FILL_MSMS if has_msms else self._COLOR_FILL
+            bg_color = self._COLOR_BG_MSMS if has_msms else self._COLOR_BG
             painter.save()
             rect = option.rect
             # Draw after default painting so it also remains visible on selected rows.
-            painter.fillRect(rect, self._COLOR_BG)
+            painter.fillRect(rect, bg_color)
             bar = QtCore.QRect(rect.x(), rect.y(), max(1, int(rect.width() * ratio)), rect.height())
-            painter.fillRect(bar, self._COLOR_FILL)
+            painter.fillRect(bar, fill_color)
             painter.restore()
 
 
@@ -540,6 +550,77 @@ class _MSMSTableDelegate(QtWidgets.QStyledItemDelegate):
                 painter.setPen(palette.color(QtGui.QPalette.Text))
                 painter.drawText(text_rect, QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft, str(text))
             painter.restore()
+
+
+class FlowLayout(QtWidgets.QLayout):
+    """A layout that arranges its child widgets left-to-right, wrapping onto a new
+    line when the available width is exceeded, so a row of controls stays usable
+    when its container is resized narrower (e.g. a docked panel)."""
+
+    def __init__(self, parent=None, margin=0, hSpacing=6, vSpacing=6):
+        super().__init__(parent)
+        self._hSpacing = hSpacing
+        self._vSpacing = vSpacing
+        self._items = []
+        self.setContentsMargins(margin, margin, margin, margin)
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index):
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self):
+        return QtCore.Qt.Orientations(QtCore.Qt.Orientation(0))
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._doLayout(QtCore.QRect(0, 0, width, 0), testOnly=True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._doLayout(rect, testOnly=False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QtCore.QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        size += QtCore.QSize(margins.left() + margins.right(), margins.top() + margins.bottom())
+        return size
+
+    def _doLayout(self, rect, testOnly):
+        margins = self.contentsMargins()
+        x = rect.x() + margins.left()
+        y = rect.y() + margins.top()
+        lineHeight = 0
+        rightEdge = rect.right() - margins.right()
+
+        for item in self._items:
+            hint = item.sizeHint()
+            nextX = x + hint.width() + self._hSpacing
+            if nextX - self._hSpacing > rightEdge and lineHeight > 0:
+                x = rect.x() + margins.left()
+                y += lineHeight + self._vSpacing
+                nextX = x + hint.width() + self._hSpacing
+                lineHeight = 0
+            if not testOnly:
+                item.setGeometry(QtCore.QRect(QtCore.QPoint(x, y), hint))
+            x = nextX
+            lineHeight = max(lineHeight, hint.height())
+
+        return y + lineHeight - rect.y() + margins.bottom()
 
 
 class _DBTestWorker(QtCore.QThread):
@@ -881,7 +962,11 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
         # Allow user to process files and view the results
         self.ui.pickingTab.setEnabled(len(filterLines) > 0)
-        self.ui.resultsTab.setEnabled(self.ui.processedFilesComboBox.count() > 0)
+        hasProcessedFiles = self.ui.processedFilesComboBox.count() > 0
+        self.ui.resultsTab.setEnabled(hasProcessedFiles)
+        if hasProcessedFiles:
+            # The group file being loaded already has processed files: auto-open the pane
+            self._showDockPane("resultsTab")
 
         return True
 
@@ -2660,11 +2745,8 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         if num is None:
             return
 
-        # Switch to experiment results tab if needed
-        for i in range(self.ui.tabWidget.count()):
-            if self.ui.tabWidget.widget(i) == self.ui.bracketedResultsTab:
-                self.ui.tabWidget.setCurrentIndex(i)
-                break
+        # Switch to experiment results pane if needed
+        self._showDockPane("bracketedResultsTab")
 
         # Find and select the matching feature in the tree
         tree = self.ui.resultsExperiment_TreeWidget
@@ -2748,19 +2830,82 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         values = self._featureValuesFromBunch(bd)
         menu = QtWidgets.QMenu()
         actions = self._addFeatureCopyMenu(menu, values)
-        if not actions:
+
+        comment_edit_action = None
+        is_feature = bd is not None and getattr(bd, "type", None) == "featurePair"
+        if is_feature:
+            menu.addSeparator()
+            current_comment = self._getFeatureComment(bd.id)
+            comment_label = current_comment if current_comment else "(no comment)"
+            info_action = menu.addAction(f"Comment: {comment_label}")
+            info_action.setEnabled(False)
+            comment_edit_action = menu.addAction("Edit Comment...")
+
+        if not actions and comment_edit_action is None:
             return
+
         chosen = menu.exec_(tree.mapToGlobal(position))
+        if chosen is None:
+            return
         if chosen in actions:
             pyperclip.copy(actions[chosen])
+        elif chosen is comment_edit_action:
+            self._editFeatureComment(bd.id)
+
+    def _getFeatureComment(self, num) -> str:
+        """Return the current 'Comment' value for the feature identified by `num` (Num column)."""
+        if not hasattr(self, "experimentResults") or self.experimentResults is None or self.experimentResults.db_con is None:
+            return ""
+        selected_table = getattr(self.experimentResults, "selected_table", None)
+        if selected_table is None or selected_table not in self.experimentResults.db_con.tables:
+            return ""
+        df = self.experimentResults.db_con.tables[selected_table]
+        if "Comment" not in df.columns:
+            return ""
+        matches = df.filter(pl.col("Num") == num)
+        if matches.height == 0:
+            return ""
+        val = matches["Comment"][0]
+        return str(val) if val is not None else ""
+
+    def _setFeatureComment(self, num, new_comment: str):
+        """Persist a new 'Comment' value for the feature identified by `num` back to the results file."""
+        if not hasattr(self, "experimentResults") or self.experimentResults is None or self.experimentResults.db_con is None:
+            return
+        selected_table = getattr(self.experimentResults, "selected_table", None)
+        if selected_table is None or selected_table not in self.experimentResults.db_con.tables:
+            return
+        db_con = self.experimentResults.db_con
+        if "Comment" not in db_con.tables[selected_table].columns:
+            return
+
+        progress = QtWidgets.QProgressDialog("MetExtract II is saving the comment...", "", 0, 0, self)
+        progress.setWindowTitle("Saving Comment")
+        progress.setCancelButton(None)
+        progress.setWindowModality(QtCore.Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+        QtWidgets.QApplication.processEvents()
+        try:
+            db_con.update_rows(selected_table, pl.col("Num") == num, {"Comment": new_comment})
+            db_con.commit()
+        except Exception:
+            logging.exception("Failed to save feature comment to results file")
+        finally:
+            progress.close()
+
+    def _editFeatureComment(self, num):
+        """Open a dialog to edit the comment of feature `num` and save it back to file."""
+        current_comment = self._getFeatureComment(num)
+        new_comment, ok = QtWidgets.QInputDialog.getMultiLineText(self, "Edit Feature Comment", f"Comment for feature {num}:", current_comment)
+        if not ok:
+            return
+        self._setFeatureComment(num, new_comment)
 
     def _showFeatureInExperimentResults(self, feature_index: int):
-        """Navigate to the experiment results tab and select the specified feature."""
-        # Switch to the experiment results tab (bracketedResultsTab)
-        for i in range(self.ui.tabWidget.count()):
-            if self.ui.tabWidget.widget(i) == self.ui.bracketedResultsTab:
-                self.ui.tabWidget.setCurrentIndex(i)
-                break
+        """Navigate to the experiment results pane and select the specified feature."""
+        # Switch to the experiment results pane (bracketedResultsTab)
+        self._showDockPane("bracketedResultsTab")
 
         # Try to find and select the feature in the tree widget
         if hasattr(self, "experimentResults") and self.experimentResults is not None:
@@ -2803,6 +2948,9 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 group_name = str(grp.name)
                 basenames = [os.path.splitext(os.path.basename(str(f)))[0] for f in grp.files]
                 experiment_data["groups"][group_name] = basenames
+
+            # Sync group colors with those defined in the Input tab
+            experiment_data["group_colors"] = {str(grp.name): grp.color for grp in self.getAllSampleGroups() if grp.color}
 
             # Load feature data from the single results table
             if hasattr(self, "experimentResults") and self.experimentResults.db_con is not None:
@@ -2864,6 +3012,9 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
             self.ui.statisticsWidget.load_experiment_data(experiment_data)
             self.ui.statisticsTab.setEnabled(True)
+            # Experimental results loaded with statistics data: auto-open both panes
+            self._showDockPane("bracketedResultsTab")
+            self._showDockPane("statisticsTab")
             logging.info(f"Statistics data loaded: {len(experiment_data.get('features', {}))} features")
 
         except Exception as e:
@@ -2887,6 +3038,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             self.drawCanvas(self.ui.resultsExperimentIsotopicPattern_plot, showLegendOverwrite=False)
             self.updateSamplePeaksTab([])
             self.updateIsotopicPatternTab([])
+            self._syncStatisticsFeatureHighlight([])
             return
 
         if len(self.ui.resultsExperiment_TreeWidget.selectedItems()) == 0:
@@ -2897,9 +3049,11 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             self.drawCanvas(self.ui.resultsExperimentIsotopicPattern_plot, showLegendOverwrite=False)
             self.updateSamplePeaksTab([])
             self.updateIsotopicPatternTab([])
+            self._syncStatisticsFeatureHighlight([])
             return
 
         plotItems = self._getSelectedExperimentPlotItems()
+        self._syncStatisticsFeatureHighlight(plotItems)
         self.updateExperimentAbundancePlot(plotItems)
         self.updateIsotopicPatternTab(plotItems)
 
@@ -3130,7 +3284,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                                     y=done * 10,
                                     x=lmz + 5.5,
                                     color=groupColor,
-                                    s="%s, max.int. %.3g" % (a, max_plotted_int),
+                                    s="%s\nmax.int. %.3g" % (a, max_plotted_int),
                                 )
 
                         # --- Overlaid EICs ---
@@ -3198,12 +3352,11 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 )
             intlim[1] = intlim[1] * 1.5
 
-            self.ui.resultsExperiment_plot.axes.set_title("Overlaid EICs of selected feature pairs or groups")
             self.ui.resultsExperiment_plot.axes.set_xlabel("Retention time (min)")
             self.ui.resultsExperiment_plot.axes.set_ylabel("Intensity")
             sepLabel = "experimental group" if separateBy == "Group" else "sample"
-            self.ui.resultsExperimentSeparatedPeaks_plot.axes.set_title("Overlaid EICs (separated artificially by %s, shift=%.2f min)" % (sepLabel, shiftMinutes))
-            if len(plotItems) == 1:
+            if len(plotItems) == 1 and False:
+                self.ui.resultsExperimentSeparatedPeaks_plot.axes.set_title("Overlaid EICs (separated artificially by %s, shift=%.2f min)" % (sepLabel, shiftMinutes))
                 self.ui.resultsExperimentSeparatedPeaks_plot.axes.set_title(
                     "EICs of %.5f (%.5f), %.2f min, %s\n(separated by %s, shift=%.2f min)"
                     % (
@@ -3268,6 +3421,17 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             if item.bunchData.type == "featurePair":
                 plotItems.append(item.bunchData)
         return plotItems
+
+    def _syncStatisticsFeatureHighlight(self, plotItems):
+        """Highlight the currently selected Experiment results feature(s) in the Statistics tab's volcano plot(s).
+
+        One-way sync (Experiment results -> Statistics): `highlight_features_by_id` never emits a signal
+        back towards Experiment results, so this cannot create a cyclic update loop.
+        """
+        if not hasattr(self.ui, "statisticsWidget"):
+            return
+        feature_ids = [pi.id for pi in plotItems if getattr(pi, "id", None) is not None]
+        self.ui.statisticsWidget.highlight_features_by_id(feature_ids)
 
     def _groupSampleStats(self, groupName, plotItems, definedGroups, rowsByNum):
         """Compute label strings for a group in the Separated peaks plot.
@@ -3444,7 +3608,6 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 "_Abundance_N": "native intensity",
                 "_Abundance_L": "labeled intensity",
             }.get(blocks[0][1], "abundance")
-        ax.set_title("Abundance profiles of selected features")
         ax.set_ylabel(f"{_value_label.capitalize()} ({'log' if log_scale else 'linear'} scale)")
         if scaling_mode != "None":
             ax.set_ylabel(f"Relative {_value_label} ({'log' if log_scale else 'linear'} scale)")
@@ -3456,7 +3619,6 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             scatter_x = []
             scatter_y = []
             scatter_colors = []
-            legend_handles = []
             block_label_positions = []  # (center_x, label)
             xtick_positions = []
             xtick_labels = []
@@ -3470,11 +3632,6 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 # keep each group's feature boxes tightly clustered while still visibly separated
                 slot_width = ABUNDANCE_BOXPLOT_CLUSTER_WIDTH / max(1, len(feature_ids))
                 box_width = slot_width * ABUNDANCE_BOXPLOT_SLOT_FILL_RATIO
-
-                # Legend: one entry per group
-                for group_index, group_name in enumerate(group_names):
-                    gcolor = group_color_map.get(group_name, f"C{group_index % 10}")
-                    legend_handles.append(patches.Patch(facecolor=gcolor, alpha=0.35, label=group_name))
 
                 base_cursor = 0.0
                 for block_label, block_suffix in blocks:
@@ -3527,6 +3684,8 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                     ax.scatter(scatter_x, scatter_y, c=scatter_colors, s=18, edgecolors="black", linewidths=0.4, alpha=0.9, zorder=3)
                 ax.set_xticks(xtick_positions)
                 ax.set_xticklabels(xtick_labels, rotation=25, ha="right")
+                for tick_label, group_name in zip(ax.get_xticklabels(), xtick_labels):
+                    tick_label.set_color(group_color_map.get(group_name, "black"))
                 ax.set_xlabel("Experimental group")
                 # Isotopolog block labels above the plot and separators between blocks
                 if block_label_positions:
@@ -3536,8 +3695,6 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                     for sep_block in range(1, len(blocks)):
                         sep_x = sep_block * (len(group_names) + block_gap) - block_gap / 2.0 - 0.5
                         ax.axvline(sep_x, color="gray", linestyle="--", linewidth=0.8)
-                if legend_handles:
-                    ax.legend(handles=legend_handles, loc="best", title="Sample group")
             else:
                 ax.text(0.5, 0.5, "No abundance values available", transform=ax.transAxes, ha="center", va="center")
         else:
@@ -3598,11 +3755,13 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
             ax.set_xticks(xtick_positions)
             ax.set_xticklabels(xtick_labels, rotation=45, ha="right")
+            tick_groups = [sample_entries[i % n_samples][0] for i in range(len(xtick_labels))] if n_samples else []
+            for tick_label, group_name in zip(ax.get_xticklabels(), tick_groups):
+                tick_label.set_color(group_color_map.get(group_name, "black"))
             if block_label_positions:
                 xaxis_transform = ax.get_xaxis_transform()
                 for center_x, label in block_label_positions:
                     ax.text(center_x, 1.0, label, transform=xaxis_transform, ha="center", va="bottom", fontsize=9, fontweight="bold")
-            ax.legend()
 
         if log_scale:
             ax.set_yscale("log")
@@ -3827,6 +3986,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 n_txt = str(n_native) if n_native > 0 else ""
                 l_txt = str(n_labeled) if n_labeled > 0 else ""
                 child.setText(6, f"{n_txt}/{l_txt}" if has_msms else "")
+                child.setData(0, _RELATIVE_BAR_HAS_MSMS_ROLE, has_msms)
 
                 title = child.text(0)
                 if has_msms and not title.startswith("*"):
@@ -11552,10 +11712,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                     )
                     break
 
-        sorted_scans = [(s["scan"], s["form"], s["file"], s.get("feature_num"), s.get("o_group"), s.get("xn"), s.get("filter_string"), s.get("filter_replacement")) for s in all_ms2_scans]
-        sorted_scans = natSort(sorted_scans, key=lambda x: x[0].precursor_intensity)
-
-        # Build feature_num -> set of forms for the MS2 filter
+        # Build feature_num -> set of forms for the MS2 filter (computed from ALL matching scans)
         _msms_feature_forms = {}
         for s in all_ms2_scans:
             fn = s.get("feature_num")
@@ -11564,6 +11721,9 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                     _msms_feature_forms[fn] = set()
                 _msms_feature_forms[fn].add(s["form"])
         self._exp_msms_feature_forms = _msms_feature_forms
+
+        sorted_scans = [(s["scan"], s["form"], s["file"], s.get("feature_num"), s.get("o_group"), s.get("xn"), s.get("filter_string"), s.get("filter_replacement")) for s in all_ms2_scans]
+        sorted_scans = natSort(sorted_scans, key=lambda x: x[0].precursor_intensity)
 
         _native_color = QtGui.QColor(30, 144, 255, 60)
         _labeled_color = QtGui.QColor(178, 34, 34, 60)
@@ -16215,7 +16375,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                                 y=done * 10,
                                 x=pi.lmz + 5.5,
                                 color=group.color,
-                                s="%s, max.int. %.3g" % (a, max_plotted_int),
+                                s="%s\nmax.int. %.3g" % (a, max_plotted_int),
                             )
 
                         self.ui.resultsExperiment_plot.axes.plot(
@@ -16402,7 +16562,6 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 )
             intlim[1] = intlim[1] * 1.5
 
-            self.ui.resultsExperiment_plot.axes.set_title("Overlaid EICs of selected feature pairs or groups")
             self.ui.resultsExperiment_plot.axes.set_xlabel("Retention time (min)")
             self.ui.resultsExperiment_plot.axes.set_ylabel("Intensity")
             self.ui.resultsExperimentSeparatedPeaks_plot.axes.set_title("Overlaid EICs of selected feature pairs or groups (separated artificially by respective %s)" % ("experimental group" if self.ui.comboBox_separatePeaks.currentText() == "Group" else "sample"))
@@ -17316,6 +17475,341 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         layout.addWidget(btn_close)
         dialog.exec_()
 
+    # <editor-fold desc="### VS Code-like dockable page layout">
+    def _setupDockLayout(self):
+        """Turn the fixed central QTabWidget pages into independent QDockWidgets so the
+        main window behaves like a VS Code editor area: panes can be tabbed together,
+        split into an N x M grid on any side, dragged out into a floating window
+        (de-docked), and closed/re-opened again via the "View" menu.
+        """
+        self.setDockNestingEnabled(True)
+        self.setDockOptions(QtWidgets.QMainWindow.AnimatedDocks | QtWidgets.QMainWindow.AllowNestedDocks | QtWidgets.QMainWindow.AllowTabbedDocks)
+        self.setTabPosition(QtCore.Qt.AllDockWidgetAreas, QtWidgets.QTabWidget.North)
+
+        # (objectName, title, page widget, default visible)
+        pageDefs = [
+            ("inputTab", "Input", self.ui.inputTab, True),
+            ("pickingTab", "Process", self.ui.pickingTab, True),
+            ("resultsTab", "Sample results", self.ui.resultsTab, False),
+            ("bracketedResultsTab", "Experiment results", self.ui.bracketedResultsTab, False),
+            ("statisticsTab", "Statistics", self.ui.statisticsTab, False),
+        ]
+
+        self._dockWidgets = {}
+        previousDock = None
+        for objName, title, page, defaultVisible in pageDefs:
+            page.setParent(None)
+            page.setEnabled(True)  # docks control visibility/availability now, not the (removed) tab widget
+            dock = QtWidgets.QDockWidget(title, self)
+            dock.setObjectName(objName + "_dock")
+            dock.setWidget(page)
+            dock.setFeatures(QtWidgets.QDockWidget.DockWidgetMovable | QtWidgets.QDockWidget.DockWidgetFloatable | QtWidgets.QDockWidget.DockWidgetClosable)
+            dock.setAllowedAreas(QtCore.Qt.AllDockWidgetAreas)  # let the user drag it to any side, not just tabify
+            self.addDockWidget(QtCore.Qt.RightDockWidgetArea, dock)
+            if previousDock is not None:
+                self.tabifyDockWidget(previousDock, dock)
+            dock.setVisible(defaultVisible)
+            previousDock = dock
+            self._dockWidgets[objName] = dock
+
+        # The old tab widget and its container are no longer needed; the pages now live in docks
+        self.ui.tabWidget.setParent(None)
+        self.ui.tabWidget.deleteLater()
+
+        # Drop the (otherwise empty) central widget so the docks occupy the entire window
+        # instead of leaving a blank pane reserved for it on the left
+        self.takeCentralWidget()
+
+        self._dockWidgets["inputTab"].raise_()
+
+        self._buildViewMenu()
+        self._buildLayoutMenuActions()
+
+        # The "Experiment results" pane has its own tab strip (tabWidget_3); turn it into a
+        # nested dockable area too, so its panels can likewise be tabbed, split or shown
+        # side by side, freely arranged within the "Experiment results" pane.
+        self._splitSeparatedPeaksTab()
+        self._wrapRowInCollapsibleFlowLayout(self.ui.horizontalLayout_abundance_controls, "visualization options")
+        self._wrapRowInCollapsibleFlowLayout(self.ui.horizontalLayout_isotopic_pattern_controls, "visualization options")
+        self._rearrangeIsotopicPatternPanel()
+
+        # "Abundance profiles"/"Separated peaks" plots inherited their min width from a
+        # much wider (pre-split/pre-side-by-side) layout; shrink it to 30% so all three
+        # row1 panels actually fit side by side
+        self.ui.resultsExperimentAbundance_widget.setMinimumWidth(round(self.ui.resultsExperimentAbundance_widget.minimumWidth() * 0.3))
+        self.ui.resultsExperiment_widget.setMinimumWidth(round(self.ui.resultsExperiment_widget.minimumWidth() * 0.3))
+
+        self._convertTabWidgetToDockArea(self.ui.tabWidget_3, arrange=self._arrangeExperimentResultDocks)
+
+    def _rearrangeIsotopicPatternPanel(self):
+        """Put the isotopic-enrichment table beside the plot (30% width) instead of
+        stacked below it (70%/30% horizontal split instead of the original vertical one).
+        """
+        splitter = self.ui.splitter_isotopic_pattern
+        splitter.setOrientation(QtCore.Qt.Horizontal)
+        splitter.setStretchFactor(0, 7)
+        splitter.setStretchFactor(1, 3)
+        splitter.setSizes([700, 300])
+
+    def _convertTabWidgetToDockArea(self, tabWidget, arrange=None):
+        """Replace *tabWidget* in-place with an embedded QMainWindow whose dock widgets
+        hold the former tab pages, so the user can freely rearrange/split/tabify/float
+        them, mirroring the outer VS Code-like page layout.
+
+        By default all panes are simply tabified together. Pass *arrange* (a callable
+        taking `(dockArea, docksByTitle)`) to build a custom default N x M layout instead.
+        """
+        parentLayout = tabWidget.parentWidget().layout()
+        layoutIndex = parentLayout.indexOf(tabWidget)
+        gridPosition = None
+        if isinstance(parentLayout, QtWidgets.QGridLayout):
+            gridPosition = parentLayout.getItemPosition(layoutIndex)
+
+        pages = [(tabWidget.widget(i), tabWidget.tabText(i)) for i in range(tabWidget.count())]
+
+        dockArea = QtWidgets.QMainWindow()
+        dockArea.setDockNestingEnabled(True)
+        dockArea.setDockOptions(QtWidgets.QMainWindow.AnimatedDocks | QtWidgets.QMainWindow.AllowNestedDocks | QtWidgets.QMainWindow.AllowTabbedDocks)
+        dockArea.setTabPosition(QtCore.Qt.AllDockWidgetAreas, QtWidgets.QTabWidget.North)
+
+        docksByTitle = {}
+        previousDock = None
+        for page, title in pages:
+            page.setParent(None)
+            dock = QtWidgets.QDockWidget(title, dockArea)
+            dock.setWidget(page)
+            dock.setFeatures(QtWidgets.QDockWidget.DockWidgetMovable | QtWidgets.QDockWidget.DockWidgetFloatable | QtWidgets.QDockWidget.DockWidgetClosable)
+            dock.setAllowedAreas(QtCore.Qt.AllDockWidgetAreas)  # let the user drag it left/right/top/bottom, not just tabify
+            docksByTitle[title] = dock
+            if arrange is None:
+                dockArea.addDockWidget(QtCore.Qt.LeftDockWidgetArea, dock)
+                if previousDock is not None:
+                    dockArea.tabifyDockWidget(previousDock, dock)
+                previousDock = dock
+
+        if arrange is not None:
+            arrange(dockArea, docksByTitle)
+
+        tabWidget.setParent(None)
+        tabWidget.deleteLater()
+
+        if gridPosition is not None:
+            row, col, rowSpan, colSpan = gridPosition
+            parentLayout.addWidget(dockArea, row, col, rowSpan, colSpan)
+        else:
+            parentLayout.addWidget(dockArea)
+
+        return dockArea
+
+    def _arrangeExperimentResultDocks(self, dockArea, docksByTitle):
+        """Default N x M layout for the "Experiment results" nested dock area: the three
+        overview plots side by side on top, the remaining detail panels tabbed together
+        (MS/MS active) below.
+        """
+        topRow = [docksByTitle["Raw XICs"], docksByTitle["Abundance profiles"], docksByTitle["Separated peaks"]]
+        dockArea.addDockWidget(QtCore.Qt.TopDockWidgetArea, topRow[0])
+        for previous, dock in zip(topRow, topRow[1:]):
+            dockArea.splitDockWidget(previous, dock, QtCore.Qt.Horizontal)
+
+        bottomTitles = [title for title in docksByTitle if title not in ("Raw XICs", "Abundance profiles", "Separated peaks")]
+        bottomRow = [docksByTitle[title] for title in bottomTitles]
+        dockArea.addDockWidget(QtCore.Qt.BottomDockWidgetArea, bottomRow[0])
+        for dock in bottomRow[1:]:
+            dockArea.tabifyDockWidget(bottomRow[0], dock)
+        msmsDock = docksByTitle.get("MS/MS")
+        if msmsDock is not None:
+            msmsDock.raise_()
+
+    def _splitSeparatedPeaksTab(self):
+        """The former "Separated peaks" tab held two stacked plots in a splitter (U: the
+        separated-peaks plot, L: the MS1 scan-peaks plot), while its "Separate
+        according to"/"Shift" controls, which actually control the U plot, confusingly
+        lived on the neighboring "Raw XICs" tab. Split them into their own panels:
+        "Separated peaks" (U plot + its controls) and "MS1 isotope patterns" (L plot),
+        independent from "Raw XICs".
+        """
+        tabWidget = self.ui.tabWidget_3
+
+        self.ui.gridLayout_43.removeItem(self.ui.horizontalLayout_22)
+        self.ui.resultsExperiment_widget.setParent(None)
+        self.ui.resultsExperimentMSScan_widget.setParent(None)
+        tabWidget.removeTab(tabWidget.indexOf(self.ui.tab_5))
+        self.ui.tab_5.deleteLater()
+
+        separatedPeaksPage = QtWidgets.QWidget()
+        separatedPeaksLayout = QtWidgets.QVBoxLayout(separatedPeaksPage)
+        separatedPeaksLayout.setContentsMargins(4, 4, 4, 4)
+        controlsRow = QtWidgets.QWidget()
+        controlsRow.setLayout(self.ui.horizontalLayout_22)
+        controlsSection = self._makeCollapsibleSection(controlsRow, "peak-separation options")
+        separatedPeaksLayout.addWidget(controlsSection, 0)
+        separatedPeaksLayout.addWidget(self.ui.resultsExperiment_widget, 1)
+
+        isotopePatternsPage = QtWidgets.QWidget()
+        isotopePatternsLayout = QtWidgets.QVBoxLayout(isotopePatternsPage)
+        isotopePatternsLayout.setContentsMargins(4, 4, 4, 4)
+        isotopePatternsLayout.addWidget(self.ui.resultsExperimentMSScan_widget)
+
+        insertIndex = tabWidget.indexOf(self.ui.tab_6)
+        tabWidget.insertTab(insertIndex, separatedPeaksPage, "Separated peaks")
+        tabWidget.insertTab(insertIndex + 1, isotopePatternsPage, "MS1 isotope patterns")
+
+    def _wrapRowInCollapsibleFlowLayout(self, oldLayout, label):
+        """Rebuild the QHBoxLayout *oldLayout* as a `FlowLayout` (so it wraps onto
+        extra lines instead of clipping when narrowed) and hide it behind a
+        "Show/Hide <label>" toggle at the same original position, mirroring the
+        "Show tools"/"Show filters" pattern used above the experiment-results tree.
+        """
+        parentWidget = oldLayout.parentWidget()
+        parentLayout = parentWidget.layout()
+        idx = next(i for i in range(parentLayout.count()) if parentLayout.itemAt(i).layout() is oldLayout)
+        gridPosition = parentLayout.getItemPosition(idx) if isinstance(parentLayout, QtWidgets.QGridLayout) else None
+        parentLayout.takeAt(idx)
+
+        widgets = []
+        while oldLayout.count():
+            item = oldLayout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widgets.append(widget)
+        oldLayout.deleteLater()
+
+        contentWidget = QtWidgets.QWidget()
+        flow = FlowLayout(hSpacing=8, vSpacing=4)
+        contentWidget.setLayout(flow)
+        for widget in widgets:
+            flow.addWidget(widget)
+
+        section = self._makeCollapsibleSection(contentWidget, label)
+
+        if gridPosition is not None:
+            row, col, rowSpan, colSpan = gridPosition
+            parentLayout.addWidget(section, row, col, rowSpan, colSpan)
+        else:
+            parentLayout.addWidget(section)
+        return section
+
+    def _makeCollapsibleSection(self, contentWidget, label):
+        """Wrap *contentWidget* behind a "Show/Hide <label>" toggle button, content
+        hidden by default, mirroring the "Show tools"/"Show filters" pattern used
+        above the experiment-results tree.
+        """
+        container = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        toggleBtn = QtWidgets.QPushButton("Show %s \u25be" % label)
+        toggleBtn.setCheckable(True)
+        toggleBtn.setChecked(False)
+        contentWidget.setVisible(False)
+
+        def _onToggled(checked):
+            contentWidget.setVisible(checked)
+            toggleBtn.setText(("Hide %s \u25b4" if checked else "Show %s \u25be") % label)
+
+        toggleBtn.toggled.connect(_onToggled)
+        layout.addWidget(toggleBtn)
+        layout.addWidget(contentWidget)
+        return container
+
+    def _buildViewMenu(self):
+        """Add a "View" menu that lets the user re-open any closed/hidden pane."""
+        self.ui.menuView = QtWidgets.QMenu(self.ui.menuBar)
+        self.ui.menuView.setTitle("View")
+        for objName in ("inputTab", "pickingTab", "resultsTab", "bracketedResultsTab", "statisticsTab"):
+            action = self._dockWidgets[objName].toggleViewAction()
+            self.ui.menuView.addAction(action)
+        # Insert "View" right after "File" (before "Tools")
+        self.ui.menuBar.insertMenu(self.ui.menuTools.menuAction(), self.ui.menuView)
+
+    def _showDockPane(self, objName):
+        """Make the pane identified by *objName* (e.g. "resultsTab") visible and raise it."""
+        dock = self._dockWidgets.get(objName)
+        if dock is None:
+            return
+        dock.setVisible(True)
+        dock.raise_()
+
+    def _layoutsDir(self):
+        """Directory holding saved dock-layout files, inside the app's data folder."""
+        layoutsDir = os.path.join(get_app_folder(), "layouts")
+        os.makedirs(layoutsDir, exist_ok=True)
+        return layoutsDir
+
+    def _buildLayoutMenuActions(self):
+        """Add "Save Layout..." and a "Load Layout" submenu (populated on-demand with the
+        names of previously saved layouts) to the "File" menu, so the user can persist and
+        restore custom dock arrangements without ever picking a file/path themselves.
+        """
+        self.ui.actionSaveLayout = QtGui.QAction("Save Layout...", self)
+        self.ui.actionSaveLayout.triggered.connect(self._saveCurrentLayout)
+
+        self.ui.menuLoadLayout = QtWidgets.QMenu("Load Layout", self.ui.menuFile)
+        self.ui.menuLoadLayout.aboutToShow.connect(self._populateLoadLayoutMenu)
+
+        self.ui.menuFile.insertAction(self.ui.exitMenue, self.ui.actionSaveLayout)
+        self.ui.menuFile.insertMenu(self.ui.exitMenue, self.ui.menuLoadLayout)
+        self.ui.menuFile.insertSeparator(self.ui.exitMenue)
+
+    def _saveCurrentLayout(self):
+        """Ask the user for a layout name and save the current dock arrangement under it."""
+        name, ok = QtWidgets.QInputDialog.getText(self, "Save Layout", "Layout name:")
+        if not ok or not name.strip():
+            return
+
+        safeName = re.sub(r"[^\w\- ]", "_", name.strip())
+        layoutFile = os.path.join(self._layoutsDir(), f"{safeName}.layout")
+
+        if os.path.exists(layoutFile):
+            reply = QtWidgets.QMessageBox.question(
+                self,
+                "Save Layout",
+                f"A layout named '{safeName}' already exists. Overwrite it?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            )
+            if reply != QtWidgets.QMessageBox.Yes:
+                return
+
+        try:
+            with open(layoutFile, "wb") as fout:
+                fout.write(bytes(self.saveState()))
+        except Exception:
+            logging.exception("Could not save layout '%s'", safeName)
+            QtWidgets.QMessageBox.warning(self, "Save Layout", f"Could not save layout '{safeName}'.")
+
+    def _populateLoadLayoutMenu(self):
+        """Rebuild the "Load Layout" submenu with the names of all saved layouts."""
+        self.ui.menuLoadLayout.clear()
+
+        layoutsDir = self._layoutsDir()
+        layoutNames = sorted(fname[: -len(".layout")] for fname in os.listdir(layoutsDir) if fname.endswith(".layout"))
+
+        if not layoutNames:
+            noneAction = self.ui.menuLoadLayout.addAction("(no saved layouts)")
+            noneAction.setEnabled(False)
+            return
+
+        for layoutName in layoutNames:
+            action = self.ui.menuLoadLayout.addAction(layoutName)
+            action.triggered.connect(lambda checked=False, name=layoutName: self._loadLayoutByName(name))
+
+    def _loadLayoutByName(self, name):
+        """Restore a previously saved dock arrangement by *name*."""
+        layoutFile = os.path.join(self._layoutsDir(), f"{name}.layout")
+        try:
+            with open(layoutFile, "rb") as fin:
+                state = fin.read()
+        except Exception:
+            logging.exception("Could not read layout '%s'", name)
+            QtWidgets.QMessageBox.warning(self, "Load Layout", f"Could not read layout '{name}'.")
+            return
+
+        if not self.restoreState(QtCore.QByteArray(state)):
+            QtWidgets.QMessageBox.warning(self, "Load Layout", f"Could not apply layout '{name}'.")
+            return
+
+    # </editor-fold>
+
     # initialise main interface, triggers and command line parameters
     def __init__(self, module="TracExtract", parent=None, silent=False, disableR=False):
         super(Ui_MainWindow, self).__init__()
@@ -17323,6 +17817,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
         self.setWindowTitle("MetExtract II - %s" % module)
+        self._setupDockLayout()
 
         # Install relative-intensity bar delegate on column 0 of both result trees
         self._relative_bar_delegate_sample = _RelativeBarDelegate(self)
@@ -17689,7 +18184,6 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
         self.ui.workingCore.toggled.connect(self.updateCores)
 
-        self.ui.tabWidget.setCurrentIndex(0)
         self.ui.tabWidget_2.setCurrentIndex(0)
 
         self.ui.isotopeAText.textChanged.connect(self.isotopeATextChanged)
@@ -18195,7 +18689,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.ui.peak_scaleError.setVisible(False)
 
         # todo: implement results view with all brackated feature pairs
-        self.ui.tabWidget.setTabEnabled(3, True)
+        self.ui.bracketedResultsTab.setEnabled(True)
 
         self.loadedMZXMLs = None
         # resultsExperimentChangedNew is used only by showCustomFeature (loads raw mzXML);
@@ -18206,8 +18700,9 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.ui.msms_SpectraList.customContextMenuRequested.connect(lambda pos: self._show_msms_context_menu(self.ui.msms_SpectraList, pos))
         self.ui.msms_SpectraList_exp.customContextMenuRequested.connect(lambda pos: self._show_msms_context_menu(self.ui.msms_SpectraList_exp, pos))
 
-        # Additional MS/MS controls in experiment-results tab
-        self.ui.msms_controls_exp = QtWidgets.QHBoxLayout()
+        # Additional MS/MS controls in experiment-results tab (flow-wrapped so they
+        # remain usable when the panel is narrowed instead of clipping the table)
+        self.ui.msms_controls_exp = FlowLayout(hSpacing=6, vSpacing=4)
         self.ui.btn_msms_similarity_native = QtWidgets.QPushButton("Native similarity")
         self.ui.btn_msms_similarity_labeled = QtWidgets.QPushButton("Labeled similarity")
         self.ui.btn_msms_overview = QtWidgets.QPushButton("MS/MS overview")
@@ -18218,7 +18713,6 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.ui.msms_controls_exp.addWidget(self.ui.btn_msms_overview)
         self.ui.msms_controls_exp.addWidget(self.ui.btn_msms_export_mgf)
         self.ui.msms_controls_exp.addWidget(self.ui.btn_msms_filter_strings)
-        self.ui.msms_controls_exp.addStretch(1)
         self.ui.verticalLayout_msms_exp.insertLayout(1, self.ui.msms_controls_exp)
         self.ui.btn_msms_similarity_native.clicked.connect(lambda: self._show_msms_similarity_dialog("native"))
         self.ui.btn_msms_similarity_labeled.clicked.connect(lambda: self._show_msms_similarity_dialog("labeled"))

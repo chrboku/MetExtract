@@ -21,7 +21,6 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFrame,
-    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -38,6 +37,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 import logging
+import math
 from typing import Any, Dict, List, Optional, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
@@ -52,6 +52,30 @@ from .statisticsModule import DataQualityAnalysis, MultivariateAnalysis, Selecti
 matplotlib.use("Qt5Agg")
 
 QComboBox = CtrlWheelComboBox
+
+# Reference sizes matching matplotlib's own defaults, used as the 100% baseline for _scale_plot_fonts()
+_BASE_TITLE_FONTSIZE = 18.0
+_BASE_LABEL_FONTSIZE = 18.0
+_BASE_TICK_FONTSIZE = 18.0
+
+
+def _scale_plot_fonts(fig, scale: float):
+    """Scale every axes' title/axis-label/tick/legend font size in `fig` to `scale` times matplotlib's defaults."""
+    title_size = _BASE_TITLE_FONTSIZE * scale
+    label_size = _BASE_LABEL_FONTSIZE * scale
+    tick_size = _BASE_TICK_FONTSIZE * scale
+    for ax in fig.get_axes():
+        if ax.get_title():
+            ax.title.set_fontsize(title_size)
+        ax.xaxis.label.set_fontsize(label_size)
+        ax.yaxis.label.set_fontsize(label_size)
+        ax.tick_params(axis="both", labelsize=tick_size)
+        legend = ax.get_legend()
+        if legend is not None:
+            for text in legend.get_texts():
+                text.set_fontsize(tick_size)
+    if fig._suptitle is not None:
+        fig._suptitle.set_fontsize(title_size)
 
 
 class AddComparisonDialog(QDialog):
@@ -163,6 +187,7 @@ class InteractiveVolcanoCanvas(FigureCanvas):
         self.highlighted_indices = []
         self.rect_selector = None
         self._press_pos = None
+        self.title = "Volcano Plot"
 
         # Set up matplotlib event handling
         self.fig.canvas.mpl_connect("key_press_event", self._on_key_press)
@@ -270,7 +295,7 @@ class InteractiveVolcanoCanvas(FigureCanvas):
             # Show error message
             self.axes.clear()
             error_msg = self.volcano_data.get("error", "Unknown error")
-            self.axes.text(0.5, 0.5, f"Error:\n{error_msg}", ha="center", va="center", transform=self.axes.transAxes, fontsize=10, color="red", wrap=True)
+            self.axes.text(0.5, 0.5, f"Error:\n{error_msg}", ha="center", va="center", transform=self.axes.transAxes, color="red", wrap=True)
             self.axes.set_xlim(0, 1)
             self.axes.set_ylim(0, 1)
             self.fig.tight_layout()
@@ -287,7 +312,7 @@ class InteractiveVolcanoCanvas(FigureCanvas):
 
         # Check if we have data to plot
         if len(log2_fc) == 0:
-            self.axes.text(0.5, 0.5, "No features to plot", ha="center", va="center", transform=self.axes.transAxes, fontsize=12, color="gray")
+            self.axes.text(0.5, 0.5, "No features to plot", ha="center", va="center", transform=self.axes.transAxes, color="gray")
             self.fig.tight_layout()
             self.draw()
             return
@@ -331,12 +356,13 @@ class InteractiveVolcanoCanvas(FigureCanvas):
 
         self.axes.set_xlabel("log₂(Fold Change)")
         self.axes.set_ylabel("-log₁₀(p-value)")
-        self.axes.set_title("Volcano Plot")
+        self.axes.set_title(self.title)
 
         if old_xlim is not None and old_ylim is not None:
             self.axes.set_xlim(old_xlim)
             self.axes.set_ylim(old_ylim)
 
+        _scale_plot_fonts(self.fig, 0.5)
         self.fig.tight_layout()
         self.draw()
 
@@ -353,59 +379,68 @@ class InteractiveVolcanoCanvas(FigureCanvas):
 
 
 class MultiVolcanoWidget(QWidget):
-    """Widget for displaying multiple volcano plots simultaneously."""
+    """Displays all volcano plot comparisons as subplots of a single figure.
 
-    featureSelected = Signal(list)  # Signal when features are selected
+    A single `NavigationToolbar` controls zoom/pan; each subplot's axes are
+    independent (matplotlib toolbar zoom/pan acts on whichever axes the mouse
+    is over), so panning/zooming one comparison doesn't affect the others.
+    Selecting a feature (click or rectangle-drag) in any subplot highlights it
+    in every subplot, since all comparisons share the same underlying feature
+    ordering (`data.index` of the active feature table).
+    """
+
+    featureSelected = Signal(list)  # Signal when features are selected (position indices)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.layout = QGridLayout(self)
-        self.volcano_canvases: List[InteractiveVolcanoCanvas] = []
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.fig = Figure(figsize=(10, 8), dpi=100)
+        self.canvas = FigureCanvas(self.fig)
+        self.toolbar = NavigationToolbar(self.canvas, self)
+        outer_layout.addWidget(self.toolbar)
+        outer_layout.addWidget(self.canvas)
+
+        self.subplots: List[Dict[str, Any]] = []  # {"ax", "title", "volcano_data", "rect_selector"}
+        self.highlighted_indices: List[int] = []
         self.selection_manager = SelectionManager()
         self.selection_manager.register_callback(self._on_selection_changed)
 
+        self._press_pos = None
+        self._press_ax = None
+        self.canvas.mpl_connect("button_press_event", self._on_mouse_press)
+        self.canvas.mpl_connect("button_release_event", self._on_mouse_release)
+        self.canvas.mpl_connect("key_press_event", self._on_key_press)
+
     def set_comparisons(self, comparisons: List[Tuple[str, str]], data: Dict[str, Any]):
         """
-        Set up volcano plots for all comparisons.
+        Set up volcano subplots for all comparisons.
 
         Args:
             comparisons: List of (group1, group2) tuples
             data: Dictionary containing feature data and group info
         """
-        # Clear layout - this deletes container widgets and their children (including canvases)
-        while self.layout.count():
-            item = self.layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
-        # Reset the canvases tracking list
-        self.volcano_canvases.clear()
+        self.fig.clear()
+        self.subplots.clear()
+        self.highlighted_indices = []
 
         if not comparisons:
+            self.canvas.draw()
             return
 
-        # Calculate grid layout
+        # 2 or 3 comparisons stack vertically (1 column); 4+ switch to a rows x columns grid.
         n_plots = len(comparisons)
-        cols = min(3, n_plots)
-        (n_plots + cols - 1) // cols
+        if n_plots <= 3:
+            cols = 1
+            rows = n_plots
+        else:
+            cols = math.ceil(math.sqrt(n_plots))
+            rows = math.ceil(n_plots / cols)
 
         for i, (group1, group2) in enumerate(comparisons):
-            canvas = InteractiveVolcanoCanvas(self)
-            canvas.selectionChanged.connect(self._handle_selection)
-
-            row = i // cols
-            col = i % cols
-
-            # Create container with label
-            container = QFrame()
-            container_layout = QVBoxLayout(container)
-            label = QLabel(f"{group1} vs {group2}")
-            label.setAlignment(Qt.AlignCenter)
-            container_layout.addWidget(label)
-            container_layout.addWidget(canvas)
-
-            self.layout.addWidget(container, row, col)
-            self.volcano_canvases.append(canvas)
+            ax = self.fig.add_subplot(rows, cols, i + 1)
+            entry = {"ax": ax, "title": f"{group1} vs {group2}", "volcano_data": None, "rect_selector": None}
 
             # Calculate volcano data for this comparison
             if "feature_data" in data and "group_info" in data:
@@ -414,18 +449,166 @@ class MultiVolcanoWidget(QWidget):
 
                 if group1 in group_info and group2 in group_info:
                     metadata = data.get("metadata") if "metadata" in data else None
-                    volcano_data = UnivariateAnalysis.calculate_volcano_data(feature_data, group_info[group1], group_info[group2], metadata=metadata)
-                    canvas.set_volcano_data(volcano_data)
+                    entry["volcano_data"] = UnivariateAnalysis.calculate_volcano_data(feature_data, group_info[group1], group_info[group2], metadata=metadata)
+
+            self.subplots.append(entry)
+            self._draw_subplot(entry)
+
+            entry["rect_selector"] = RectangleSelector(
+                ax,
+                lambda eclick, erelease, entry=entry: self._on_rect_select(entry, eclick, erelease),
+                useblit=True,
+                button=[1],
+                minspanx=5,
+                minspany=5,
+                spancoords="pixels",
+                interactive=True,
+            )
+
+        _scale_plot_fonts(self.fig, 0.5)
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+    def _draw_subplot(self, entry: Dict[str, Any], preserve_view: bool = False):
+        """(Re)draw a single subplot's volcano data, honoring the current highlight set."""
+        ax = entry["ax"]
+        vd = entry["volcano_data"]
+
+        old_xlim = old_ylim = None
+        if preserve_view and ax.has_data():
+            old_xlim, old_ylim = ax.get_xlim(), ax.get_ylim()
+
+        ax.clear()
+        ax.set_title(entry["title"])
+
+        if vd is None or not vd.get("success", False):
+            error_msg = "No data" if vd is None else vd.get("error", "Unknown error")
+            ax.text(0.5, 0.5, f"Error:\n{error_msg}", ha="center", va="center", transform=ax.transAxes, color="red", wrap=True)
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1)
+            return
+
+        log2_fc = vd["log2_fc"]
+        neg_log10_pval = vd["neg_log10_pval"]
+        significant = vd["significant"]
+        fc_threshold = vd.get("fc_threshold", 1.0)
+        pvalue_threshold = vd.get("pvalue_threshold", 0.05)
+
+        if len(log2_fc) == 0:
+            ax.text(0.5, 0.5, "No features to plot", ha="center", va="center", transform=ax.transAxes, color="gray")
+            return
+
+        highlighted_set = set(self.highlighted_indices)
+        colors = []
+        for i, sig in enumerate(significant):
+            if i in highlighted_set:
+                colors.append("gray")  # hidden by highlighted overlay below
+            elif sig:
+                colors.append("red" if log2_fc[i] > 0 else "blue")
+            else:
+                colors.append("gray")
+
+        ax.scatter(log2_fc, neg_log10_pval, c=colors, alpha=0.7, s=25, edgecolors="none")
+
+        if highlighted_set:
+            h_idx = np.array(sorted(highlighted_set))
+            valid = h_idx[h_idx < len(log2_fc)]
+            if len(valid):
+                ax.scatter(log2_fc[valid], neg_log10_pval[valid], c="green", alpha=1.0, s=50, edgecolors="darkgreen", linewidths=0.8, zorder=5)
+
+        ax.axhline(y=-np.log10(pvalue_threshold), color="gray", linestyle="--", alpha=0.5)
+        ax.axvline(x=-fc_threshold, color="gray", linestyle="--", alpha=0.5)
+        ax.axvline(x=fc_threshold, color="gray", linestyle="--", alpha=0.5)
+        ax.set_xlabel("log₂(Fold Change)")
+        ax.set_ylabel("-log₁₀(p-value)")
+
+        if old_xlim is not None:
+            ax.set_xlim(old_xlim)
+            ax.set_ylim(old_ylim)
+
+    def _on_rect_select(self, entry: Dict[str, Any], eclick, erelease):
+        """Handle rectangle selection within one subplot's axes."""
+        vd = entry["volcano_data"]
+        if vd is None or not vd.get("success", False):
+            return
+
+        x1, y1 = eclick.xdata, eclick.ydata
+        x2, y2 = erelease.xdata, erelease.ydata
+        if x1 is None or y1 is None or x2 is None or y2 is None:
+            return
+
+        x_min, x_max = min(x1, x2), max(x1, x2)
+        y_min, y_max = min(y1, y2), max(y1, y2)
+
+        log2_fc = vd["log2_fc"]
+        neg_log10_pval = vd["neg_log10_pval"]
+        selected_mask = (log2_fc >= x_min) & (log2_fc <= x_max) & (neg_log10_pval >= y_min) & (neg_log10_pval <= y_max)
+        selected_indices = np.where(selected_mask)[0].tolist()
+
+        modifiers = QtWidgets.QApplication.keyboardModifiers()
+        additive = modifiers == Qt.ControlModifier
+        self._handle_selection(selected_indices, additive)
+
+    def _on_mouse_press(self, event):
+        """Record mouse-press position/axes for drag detection."""
+        if event.button == 1:
+            self._press_pos = (event.x, event.y)
+            self._press_ax = event.inaxes
+
+    def _on_mouse_release(self, event):
+        """Emit a selection for a single-point click (no drag) on whichever subplot was clicked."""
+        if event.button != 1 or event.inaxes is None or self._press_pos is None:
+            return
+        dx = abs(event.x - self._press_pos[0])
+        dy = abs(event.y - self._press_pos[1])
+        press_ax = self._press_ax
+        self._press_pos = None
+        self._press_ax = None
+        if dx > 5 or dy > 5 or event.inaxes != press_ax:
+            return  # Was a drag; handled by the subplot's RectangleSelector
+
+        entry = next((e for e in self.subplots if e["ax"] == event.inaxes), None)
+        if entry is None:
+            return
+        vd = entry["volcano_data"]
+        if vd is None or not vd.get("success", False):
+            return
+
+        log2_fc = vd["log2_fc"]
+        neg_log10_pval = vd["neg_log10_pval"]
+        try:
+            pts_display = entry["ax"].transData.transform(np.column_stack([log2_fc, neg_log10_pval]))
+            click_display = np.array([event.x, event.y])
+            dists = np.sqrt(np.sum((pts_display - click_display) ** 2, axis=1))
+            closest = int(np.argmin(dists))
+            if dists[closest] <= 10:
+                modifiers = QtWidgets.QApplication.keyboardModifiers()
+                additive = modifiers == Qt.ControlModifier
+                self._handle_selection([closest], additive)
+        except Exception:
+            pass
+
+    def _on_key_press(self, event):
+        if event.key == "escape":
+            self.update_highlighting([])
 
     def _handle_selection(self, indices: List[int], additive: bool):
-        """Handle selection from any volcano plot."""
+        """Handle a user-driven selection from any subplot."""
         self.selection_manager.add_selection(indices, additive)
         self.featureSelected.emit(self.selection_manager.get_selected_indices())
 
     def _on_selection_changed(self, indices: List[int]):
-        """Update all volcano plots when selection changes."""
-        for canvas in self.volcano_canvases:
-            canvas.update_highlighting(indices)
+        """Update all subplots when the internal selection manager's selection changes."""
+        self.update_highlighting(indices)
+
+    def update_highlighting(self, indices: List[int]):
+        """Programmatically highlight feature positions in every subplot (no selection signal emitted)."""
+        self.highlighted_indices = list(indices)
+        for entry in self.subplots:
+            self._draw_subplot(entry, preserve_view=True)
+        _scale_plot_fonts(self.fig, 0.5)
+        self.fig.tight_layout()
+        self.canvas.draw()
 
 
 class NumericTableWidgetItem(QTableWidgetItem):
@@ -667,6 +850,7 @@ class StatisticsTabWidget(QWidget):
         self.stats_data = StatisticsData()
         self.selection_manager = SelectionManager()
         self._updating_from_volcano = False  # Guard against circular table↔volcano sync
+        self._heatmap_state: Optional[Dict[str, Any]] = None
 
         self._setup_ui()
         self._connect_signals()
@@ -675,10 +859,12 @@ class StatisticsTabWidget(QWidget):
         """Set up the user interface."""
         main_layout = QHBoxLayout(self)
 
+        # Horizontal splitter so the user can resize the tree-view vs. the plot area
+        main_splitter = QSplitter(Qt.Horizontal)
+
         # Left panel: Tree view for method selection
         left_panel = QFrame()
         left_layout = QVBoxLayout(left_panel)
-        left_panel.setMaximumWidth(300)
 
         left_layout.addWidget(QLabel("<b>Analysis Methods</b>"))
 
@@ -719,7 +905,7 @@ class StatisticsTabWidget(QWidget):
         self.feature_filter_combo.currentIndexChanged.connect(self._on_feature_filter_changed)
         left_layout.addWidget(self.feature_filter_combo)
 
-        main_layout.addWidget(left_panel)
+        main_splitter.addWidget(left_panel)
 
         # Right panel: Content area with splitter
         right_splitter = QSplitter(Qt.Vertical)
@@ -730,7 +916,29 @@ class StatisticsTabWidget(QWidget):
         self.viz_widget = QWidget()
         self.viz_layout = QVBoxLayout(self.viz_widget)
         self.viz_container.setWidget(self.viz_widget)
-        right_splitter.addWidget(self.viz_container)
+
+        # Heatmap pagination bar (only visible while the heatmap is shown); kept outside
+        # viz_layout so it is not removed by _clear_visualization()
+        self.heatmap_pagination_bar = QWidget()
+        pagination_layout = QHBoxLayout(self.heatmap_pagination_bar)
+        pagination_layout.setContentsMargins(4, 4, 4, 4)
+        self.heatmap_prev_btn = QPushButton("\u25c0 Previous 100")
+        self.heatmap_prev_btn.clicked.connect(self._heatmap_prev_page)
+        self.heatmap_next_btn = QPushButton("Next 100 \u25b6")
+        self.heatmap_next_btn.clicked.connect(self._heatmap_next_page)
+        self.heatmap_page_label = QLabel("")
+        pagination_layout.addWidget(self.heatmap_prev_btn)
+        pagination_layout.addWidget(self.heatmap_page_label)
+        pagination_layout.addWidget(self.heatmap_next_btn)
+        pagination_layout.addStretch()
+        self.heatmap_pagination_bar.setVisible(False)
+
+        viz_outer = QWidget()
+        viz_outer_layout = QVBoxLayout(viz_outer)
+        viz_outer_layout.setContentsMargins(0, 0, 0, 0)
+        viz_outer_layout.addWidget(self.heatmap_pagination_bar)
+        viz_outer_layout.addWidget(self.viz_container)
+        right_splitter.addWidget(viz_outer)
 
         # Selected features table
         table_container = QFrame()
@@ -739,14 +947,16 @@ class StatisticsTabWidget(QWidget):
         self.features_table = SelectedFeaturesTable()
         table_layout.addWidget(self.features_table)
 
-        view_feature_btn = QPushButton("View Selected in Experiment Results")
-        view_feature_btn.clicked.connect(self._view_selected_feature)
-        table_layout.addWidget(view_feature_btn)
-
         right_splitter.addWidget(table_container)
         right_splitter.setSizes([600, 200])
 
-        main_layout.addWidget(right_splitter)
+        main_splitter.addWidget(right_splitter)
+
+        main_splitter.setStretchFactor(0, 0)
+        main_splitter.setStretchFactor(1, 1)
+        main_splitter.setSizes([300, 900])
+
+        main_layout.addWidget(main_splitter)
 
         # Store current visualization widgets
         self.current_canvas = None
@@ -785,7 +995,7 @@ class StatisticsTabWidget(QWidget):
         self.selection_manager.register_callback(self._on_selection_changed)
 
     def _get_group_colors(self, groups: List[str] = None) -> Dict[str, Any]:
-        """Get consistent colors for groups based on original group order.
+        """Get consistent colors for groups, synced with the colors defined for each group in the Input tab.
 
         Args:
             groups: List of group names to get colors for. If None, uses all groups from stats_data.
@@ -795,12 +1005,13 @@ class StatisticsTabWidget(QWidget):
         """
         # Always base colors on the full original group list to ensure consistency
         all_groups = self.stats_data.get_group_names()
-        colors = plt.cm.Set1(np.linspace(0, 1, max(len(all_groups), 3)))  # min 3 to avoid edge cases
+        synced_colors = self.stats_data.group_colors
+        fallback_colors = plt.cm.Set1(np.linspace(0, 1, max(len(all_groups), 3)))  # min 3 to avoid edge cases
 
-        # Create mapping for all groups
+        # Create mapping for all groups: prefer the Input tab's group color, fall back to a generated one
         all_group_colors = {}
         for idx, group_name in enumerate(all_groups):
-            all_group_colors[group_name] = colors[idx]
+            all_group_colors[group_name] = synced_colors.get(group_name, fallback_colors[idx])
 
         # Return colors only for requested groups (or all if None)
         if groups is None:
@@ -889,6 +1100,7 @@ class StatisticsTabWidget(QWidget):
         self.current_canvas = None
         self.current_toolbar = None
         self.multi_volcano_widget = None
+        self.heatmap_pagination_bar.setVisible(False)
 
     def _show_detection_counts(self):
         """Show feature detection counts visualization."""
@@ -926,10 +1138,9 @@ class StatisticsTabWidget(QWidget):
 
             max_count = max(counts) if len(counts) > 0 else 1
             ax.hist(counts, bins=np.arange(1, max_count + 2) - 0.5, alpha=0.7, color=group_colors[group_name])
-            ax.set_xlabel("Number of replicates with detection", fontsize=8)
-            ax.set_ylabel("Number of features", fontsize=8)
-            ax.set_title(f"{group_name}", fontsize=9)
-            ax.tick_params(labelsize=7)
+            ax.set_xlabel("Number of replicates with detection")
+            ax.set_ylabel("Number of features")
+            ax.set_title(f"{group_name}")
             ax.grid(True, alpha=0.3)
 
         # Hide unused subplots
@@ -938,7 +1149,8 @@ class StatisticsTabWidget(QWidget):
             col = idx % n_cols
             axes[row, col].set_visible(False)
 
-        canvas.fig.suptitle("Feature Detection Counts by Group", fontsize=11, fontweight="bold")
+        canvas.fig.suptitle("Feature Detection Counts by Group", fontweight="bold")
+        _scale_plot_fonts(canvas.fig, 0.5)
         canvas.fig.tight_layout()
 
         self.viz_layout.addWidget(toolbar)
@@ -1011,14 +1223,13 @@ class StatisticsTabWidget(QWidget):
                 except ValueError:
                     ax.hist(rsd_clean, bins=1, alpha=0.7, color=group_colors[group_name], edgecolor="black")
 
-                ax.set_xlabel("RSD (%)", fontsize=8)
-                ax.set_ylabel("Frequency", fontsize=8)
-                ax.set_title(f"{group_name}", fontsize=9)
-                ax.tick_params(labelsize=7)
+                ax.set_xlabel("RSD (%)")
+                ax.set_ylabel("Frequency")
+                ax.set_title(f"{group_name}")
                 ax.grid(True, alpha=0.3, axis="y")
 
                 self._add_percentile_lines(ax, rsd_clean, percent_unit=True)
-                ax.legend(fontsize=7)
+                ax.legend(labelspacing=0.2, handlelength=1.0, handletextpad=0.4, borderpad=0.3, borderaxespad=0.3)
 
         # Hide unused subplots
         for idx in range(n_groups, n_rows * n_cols):
@@ -1026,7 +1237,8 @@ class StatisticsTabWidget(QWidget):
             col = idx % n_cols
             axes[row, col].set_visible(False)
 
-        canvas.fig.suptitle("Relative Standard Deviation (RSD) by Group", fontsize=11, fontweight="bold")
+        canvas.fig.suptitle("Relative Standard Deviation (RSD) by Group", fontweight="bold")
+        _scale_plot_fonts(canvas.fig, 0.5)
         canvas.fig.tight_layout()
 
         self.viz_layout.addWidget(toolbar)
@@ -1073,10 +1285,9 @@ class StatisticsTabWidget(QWidget):
 
                 if len(counts) > 0:
                     ax.bar(edges[:-1], counts, width=np.diff(edges), align="edge", alpha=0.7, color=group_colors[group_name])
-                    ax.set_xlabel("log₁₀(Intensity)", fontsize=8)
-                    ax.set_ylabel("Frequency", fontsize=8)
-                    ax.set_title(f"{group_name}", fontsize=9)
-                    ax.tick_params(labelsize=7)
+                    ax.set_xlabel("log₁₀(Intensity)")
+                    ax.set_ylabel("Frequency")
+                    ax.set_title(f"{group_name}")
                     ax.grid(True, alpha=0.3, axis="y")
 
                     all_values = group_data.values.flatten()
@@ -1084,7 +1295,7 @@ class StatisticsTabWidget(QWidget):
                     if len(positive_values) > 0:
                         log_values = np.log10(positive_values)
                         self._add_percentile_lines(ax, log_values, percent_unit=False)
-                        ax.legend(fontsize=7)
+                        ax.legend(labelspacing=0.2, handlelength=1.0, handletextpad=0.4, borderpad=0.3, borderaxespad=0.3)
 
         # Hide unused subplots
         for idx in range(n_groups, n_rows * n_cols):
@@ -1092,7 +1303,8 @@ class StatisticsTabWidget(QWidget):
             col = idx % n_cols
             axes[row, col].set_visible(False)
 
-        canvas.fig.suptitle("Feature Abundance Distribution by Group", fontsize=11, fontweight="bold")
+        canvas.fig.suptitle("Feature Abundance Distribution by Group", fontweight="bold")
+        _scale_plot_fonts(canvas.fig, 0.5)
         canvas.fig.tight_layout()
 
         self.viz_layout.addWidget(toolbar)
@@ -1158,32 +1370,126 @@ class StatisticsTabWidget(QWidget):
             # Color by group - only for selected groups
             group_colors = self._get_group_colors(selected_groups)
 
+            # Map each sample to its group (None if it doesn't belong to any selected group)
+            sample_group = {}
             for i, sample in enumerate(sample_names):
-                sample_color = "gray"
+                sample_group[i] = None
                 for group_name in selected_groups:
-                    if group_name in self.stats_data.group_info:
-                        samples = self.stats_data.group_info[group_name]
-                        if sample in samples:
-                            sample_color = group_colors[group_name]
-                            break
+                    if group_name in self.stats_data.group_info and sample in self.stats_data.group_info[group_name]:
+                        sample_group[i] = group_name
+                        break
 
-                ax.scatter(scores[i, 0], scores[i, 1], c=sample_color, s=100, alpha=0.8, edgecolors="black", linewidth=0.5)
-                ax.annotate(sample, (scores[i, 0], scores[i, 1]), fontsize=8, alpha=0.7, xytext=(5, 5), textcoords="offset points")
+            scatter_artists: Dict[Optional[str], Any] = {}
+            text_artists: Dict[int, Any] = {}
+            ellipse_artists: Dict[str, Any] = {}
+            original_alphas: Dict[int, float] = {}
+
+            for group_name in list(selected_groups) + [None]:
+                idxs = [i for i, g in sample_group.items() if g == group_name]
+                if not idxs:
+                    continue
+                color = group_colors.get(group_name, "gray") if group_name else "gray"
+                xs = scores[idxs, 0]
+                ys = scores[idxs, 1]
+                scatter_artists[group_name] = ax.scatter(xs, ys, c=[color] * len(idxs), s=100, alpha=0.8, edgecolors="black", linewidth=0.5, zorder=3)
+
+                for pos, i in enumerate(idxs):
+                    text_artists[i] = ax.annotate(
+                        sample_names[i],
+                        (xs[pos], ys[pos]),
+                        color="0.3",
+                        fontsize=_BASE_LABEL_FONTSIZE * 0.3,
+                        alpha=0.7,
+                        xytext=(5, 5),
+                        textcoords="offset points",
+                    )
+
+                # 95% confidence ellipse, only for groups with >= 3 samples
+                if group_name is not None and len(idxs) >= 3:
+                    ellipse_artists[group_name] = self._draw_confidence_ellipse(ax, xs, ys, color)
 
             ax.set_xlabel(f"PC1 ({var_ratio[0] * 100:.1f}%)")
             ax.set_ylabel(f"PC2 ({var_ratio[1] * 100:.1f}%)")
             ax.set_title(f"PCA Score Plot ({self.stats_data.num_features_used} features)")
             ax.grid(True, alpha=0.3)
 
-            # Add legend outside the plot area on the right side
-            legend_handles = [plt.Line2D([0], [0], marker="o", color="w", markerfacecolor=color, markersize=10, label=group) for group, color in group_colors.items()]
-            ax.legend(handles=legend_handles, loc="upper left", bbox_to_anchor=(1.01, 1), borderaxespad=0, fontsize=8)
-            canvas.fig.tight_layout(rect=[0, 0, 0.82, 1])
+            # Remember original alphas so hovering can dim/restore them
+            for artist in list(scatter_artists.values()) + list(text_artists.values()) + list(ellipse_artists.values()):
+                original_alphas[id(artist)] = artist.get_alpha()
+
+            self._pca_hover_data = {
+                "ax": ax,
+                "canvas": canvas,
+                "scores": scores,
+                "sample_group": sample_group,
+                "scatter_artists": scatter_artists,
+                "text_artists": text_artists,
+                "ellipse_artists": ellipse_artists,
+                "original_alphas": original_alphas,
+                "current_hover": "__unset__",
+            }
+            canvas.mpl_connect("motion_notify_event", self._on_pca_hover)
+            canvas.mpl_connect("axes_leave_event", lambda event: self._pca_apply_hover(None))
+
+            _scale_plot_fonts(canvas.fig, 0.5)
+            canvas.fig.tight_layout()
 
         self.viz_layout.addWidget(toolbar)
         self.viz_layout.addWidget(canvas)
         self.current_canvas = canvas
         self.current_toolbar = toolbar
+
+    @staticmethod
+    def _draw_confidence_ellipse(ax, xs: np.ndarray, ys: np.ndarray, color) -> Any:
+        """Draw a 95% confidence ellipse for a group's PCA scores and return the patch."""
+        from matplotlib.patches import Ellipse
+        from scipy.stats import chi2
+
+        cov = np.cov(xs, ys)
+        eigenvalues, eigenvectors = np.linalg.eigh(cov)
+        order = eigenvalues.argsort()[::-1]
+        eigenvalues, eigenvectors = eigenvalues[order], eigenvectors[:, order]
+        angle = np.degrees(np.arctan2(eigenvectors[1, 0], eigenvectors[0, 0]))
+        chi2_val = chi2.ppf(0.95, df=2)
+        width, height = 2 * np.sqrt(np.maximum(eigenvalues, 0) * chi2_val)
+        ellipse = Ellipse((np.mean(xs), np.mean(ys)), width, height, angle=angle, facecolor=color, edgecolor=color, alpha=0.15, linewidth=1.5, zorder=1)
+        ax.add_patch(ellipse)
+        return ellipse
+
+    def _on_pca_hover(self, event):
+        """Dim samples/ellipses/labels of every group other than the one being hovered over."""
+        data = getattr(self, "_pca_hover_data", None)
+        if data is None or event.inaxes != data["ax"] or event.xdata is None or event.ydata is None:
+            self._pca_apply_hover(None)
+            return
+
+        scores = data["scores"]
+        ax = data["ax"]
+        # Transform both the pointer and the sample points through the same ax.transData so the
+        # comparison stays correct regardless of any HiDPI mismatch between event.x/y and transData pixels.
+        click_display = ax.transData.transform((event.xdata, event.ydata))
+        pts_display = ax.transData.transform(scores[:, :2])
+        dists = np.sqrt(np.sum((pts_display - click_display) ** 2, axis=1))
+        closest = int(np.argmin(dists))
+        hovered_group = data["sample_group"].get(closest) if dists[closest] <= 15 else None
+        self._pca_apply_hover(hovered_group)
+
+    def _pca_apply_hover(self, hovered_group: Optional[str]):
+        """Set alpha to 30% for every artist not belonging to `hovered_group` (None = show all normally)."""
+        data = getattr(self, "_pca_hover_data", None)
+        if data is None or data["current_hover"] == hovered_group:
+            return
+        data["current_hover"] = hovered_group
+
+        for group_name, artist in data["scatter_artists"].items():
+            dim = hovered_group is not None and group_name != hovered_group
+            artist.set_alpha(0.3 if dim else data["original_alphas"][id(artist)])
+        for i, artist in data["text_artists"].items():
+            dim = hovered_group is not None and data["sample_group"].get(i) != hovered_group
+            artist.set_alpha(0.3 if dim else data["original_alphas"][id(artist)])
+        # Ellipses are intentionally left untouched by hover; dimming them didn't work reliably.
+
+        data["canvas"].draw_idle()
 
     def _show_hca(self):
         """Show HCA dendrogram."""
@@ -1232,6 +1538,7 @@ class StatisticsTabWidget(QWidget):
             dendrogram(hca_result["linkage_matrix"], labels=hca_result["sample_names"], ax=ax, leaf_rotation=90)
             ax.set_ylabel("Distance")
             ax.set_title(f"Hierarchical Cluster Analysis ({self.stats_data.num_features_used} features)")
+            _scale_plot_fonts(canvas.fig, 0.5)
             canvas.fig.tight_layout()
 
         self.viz_layout.addWidget(toolbar)
@@ -1275,43 +1582,150 @@ class StatisticsTabWidget(QWidget):
             self._show_no_data_message(f"Need at least 2 samples for heatmap\nFound {len(matched_cols)} matching samples")
             return
 
-        filtered_data = active_data[matched_cols]
-        canvas = StatisticsCanvas(self, width=10, height=8)
-        toolbar = NavigationToolbar(canvas, self)
+        # Reorder columns so samples are grouped by experimental group, for the heatmap layout
+        ordered_cols, group_segments = self._group_heatmap_columns(matched_cols, selected_groups)
+        filtered_data = active_data[ordered_cols]
 
         heatmap_result = MultivariateAnalysis.prepare_heatmap_data(filtered_data)
 
-        if heatmap_result.get("success", False):
-            ax = canvas.axes
-            data = heatmap_result["data"]
+        if not heatmap_result.get("success", False):
+            self._show_no_data_message(heatmap_result.get("error", "Could not compute heatmap"))
+            return
 
-            # Limit number of features for visualization
-            max_features = 100
-            if data.shape[0] > max_features:
-                # Select top variable features
-                var = np.var(data, axis=1)
-                top_indices = np.argsort(var)[-max_features:]
-                data = data[top_indices, :]
+        data = heatmap_result["data"]
+        # Order features by variance (descending) so pagination shows the most informative features first
+        feature_order = np.argsort(np.var(data, axis=1))[::-1]
 
-            im = ax.imshow(data, aspect="auto", cmap="RdBu_r", interpolation="nearest")
-            canvas.fig.colorbar(im, ax=ax, label="Z-score")
+        self._heatmap_state = {
+            "data": data,
+            "feature_order": feature_order,
+            "col_names": heatmap_result["col_names"],
+            "group_segments": group_segments,
+            "group_colors": self._get_group_colors(selected_groups),
+            "page": 0,
+            "page_size": 100,
+        }
+        self._render_heatmap_page()
 
-            ax.set_xlabel("Samples")
-            ax.set_ylabel("Features")
-            n_features_displayed = min(data.shape[0], 100)
-            ax.set_title(f"Feature Heat Map ({n_features_displayed}/{self.stats_data.num_features_used} features)")
+    def _group_heatmap_columns(self, matched_cols: List[str], selected_groups: List[str]) -> Tuple[List[str], List[Tuple[Optional[str], int, int]]]:
+        """Reorder sample columns so each group's samples are contiguous.
 
-            # Set sample labels if not too many
-            if len(heatmap_result["col_names"]) <= 20:
-                ax.set_xticks(range(len(heatmap_result["col_names"])))
-                ax.set_xticklabels(heatmap_result["col_names"], rotation=90, fontsize=8)
+        Returns the reordered column list and a list of (group_name, start, end) segments
+        (end exclusive) describing which columns belong to which group in the new order.
+        """
+        ordered_cols: List[str] = []
+        segments: List[Tuple[Optional[str], int, int]] = []
+        for group_name in selected_groups:
+            group_samples = self.stats_data.group_info.get(group_name, [])
+            cols_in_group = [c for c in matched_cols if c in group_samples]
+            if not cols_in_group:
+                continue
+            start = len(ordered_cols)
+            ordered_cols.extend(cols_in_group)
+            segments.append((group_name, start, len(ordered_cols)))
 
-            canvas.fig.tight_layout()
+        # Samples that don't belong to any selected group (shouldn't normally happen)
+        remaining = [c for c in matched_cols if c not in ordered_cols]
+        if remaining:
+            start = len(ordered_cols)
+            ordered_cols.extend(remaining)
+            segments.append((None, start, len(ordered_cols)))
+
+        return ordered_cols, segments
+
+    @staticmethod
+    def _insert_heatmap_spacers(data: np.ndarray, segments: List[Tuple[Optional[str], int, int]], spacer_width: int = 1) -> Tuple[np.ndarray, List[Tuple[Optional[str], int, int]]]:
+        """Insert NaN spacer columns between group segments for visual separation.
+
+        Returns the new data array and segments adjusted to the new column positions.
+        """
+        pieces = []
+        new_segments = []
+        col_cursor = 0
+        for i, (group_name, start, end) in enumerate(segments):
+            seg_data = data[:, start:end]
+            pieces.append(seg_data)
+            new_start = col_cursor
+            col_cursor += seg_data.shape[1]
+            new_segments.append((group_name, new_start, col_cursor))
+            if i < len(segments) - 1:
+                pieces.append(np.full((data.shape[0], spacer_width), np.nan))
+                col_cursor += spacer_width
+        new_data = np.concatenate(pieces, axis=1) if pieces else data
+        return new_data, new_segments
+
+    def _render_heatmap_page(self):
+        """Render the current page (up to 100 features) of the heatmap."""
+        state = self._heatmap_state
+        if state is None:
+            return
+
+        self._clear_visualization()
+
+        data = state["data"]
+        feature_order = state["feature_order"]
+        page = state["page"]
+        page_size = state["page_size"]
+        total_features = len(feature_order)
+
+        start = page * page_size
+        end = min(start + page_size, total_features)
+        page_feature_indices = feature_order[start:end]
+        page_data = data[page_feature_indices, :]
+
+        plot_data, segments = self._insert_heatmap_spacers(page_data, state["group_segments"])
+
+        canvas = StatisticsCanvas(self, width=10, height=8)
+        toolbar = NavigationToolbar(canvas, self)
+        ax = canvas.axes
+
+        cmap = matplotlib.colormaps["RdBu_r"].copy()
+        cmap.set_bad(color="white")
+        im = ax.imshow(plot_data, aspect="auto", cmap=cmap, interpolation="nearest")
+        canvas.fig.colorbar(im, ax=ax, label="Z-score")
+
+        ax.set_xlabel("Samples")
+        ax.set_ylabel("Features")
+        ax.set_title(f"Feature Heat Map (features {start + 1}-{end} of {total_features})")
+        ax.set_xticks([])
+
+        # Label each group's section once, in the group's color, above the plot
+        group_colors = state["group_colors"]
+        for group_name, seg_start, seg_end in segments:
+            if group_name is None:
+                continue
+            mid = (seg_start + seg_end - 1) / 2
+            ax.text(mid, 1.02, group_name, transform=ax.get_xaxis_transform(), ha="center", va="bottom", color=group_colors.get(group_name, "black"), rotation=90)
+
+        _scale_plot_fonts(canvas.fig, 0.5)
+        canvas.fig.tight_layout()
 
         self.viz_layout.addWidget(toolbar)
         self.viz_layout.addWidget(canvas)
         self.current_canvas = canvas
         self.current_toolbar = toolbar
+
+        # Pagination controls
+        self.heatmap_page_label.setText(f"Features {start + 1}-{end} of {total_features}")
+        self.heatmap_prev_btn.setEnabled(page > 0)
+        self.heatmap_next_btn.setEnabled(end < total_features)
+        self.heatmap_pagination_bar.setVisible(True)
+
+    def _heatmap_prev_page(self):
+        if self._heatmap_state is None or self._heatmap_state["page"] <= 0:
+            return
+        self._heatmap_state["page"] -= 1
+        self._render_heatmap_page()
+
+    def _heatmap_next_page(self):
+        if self._heatmap_state is None:
+            return
+        state = self._heatmap_state
+        max_page = (len(state["feature_order"]) - 1) // state["page_size"]
+        if state["page"] >= max_page:
+            return
+        state["page"] += 1
+        self._render_heatmap_page()
 
     def _show_all_volcano_plots(self):
         """Show all volcano plots simultaneously."""
@@ -1493,7 +1907,8 @@ class StatisticsTabWidget(QWidget):
             self._updating_from_volcano = False
 
     def _on_selection_changed(self, indices: List[int]):
-        """Handle selection manager updates: select matching table rows and highlight volcano dots."""
+        """Handle selection manager updates: select matching table rows, highlight volcano dots,
+        and automatically show the (first) selected feature in the Experiment results pane."""
         feature_ids = indices
         if self.current_volcano_data and self.current_volcano_data.get("success", False):
             feature_names = self.current_volcano_data.get("feature_names", [])
@@ -1502,9 +1917,14 @@ class StatisticsTabWidget(QWidget):
 
         self._select_table_rows(feature_ids)
 
-        # Highlight dots in the volcano plot
+        if feature_ids:
+            self.showFeatureInExperiment.emit(feature_ids[0])
+
+        # Highlight dots in the volcano plot(s)
         if self.current_canvas is not None:
             self.current_canvas.update_highlighting(indices)
+        if self.multi_volcano_widget is not None:
+            self.multi_volcano_widget.update_highlighting(indices)
 
     def _on_table_row_selected(self):
         """Highlight volcano dots corresponding to table rows selected by the user."""
@@ -1526,21 +1946,34 @@ class StatisticsTabWidget(QWidget):
         canvas = self.current_canvas
         if canvas is not None:
             canvas.update_highlighting(pos_indices)
-        if hasattr(self, "multi_volcano_widget") and self.multi_volcano_widget is not None:
-            for vc in self.multi_volcano_widget.volcano_canvases:
-                vc.update_highlighting(pos_indices)
+        if self.multi_volcano_widget is not None:
+            self.multi_volcano_widget.update_highlighting(pos_indices)
+
+    def highlight_features_by_id(self, feature_ids: List[int]):
+        """Highlight features selected in the Experiment results pane in the currently shown volcano plot(s)
+        and select the matching row(s) in the Selected Features table underneath.
+
+        Uses the `_updating_from_volcano` guard when touching the table so this one-way sync from
+        Experiment results can never trigger a call back into Experiment results.
+        """
+        if self.current_volcano_data is None or not self.current_volcano_data.get("success", False):
+            return
+        feature_names = self.current_volcano_data.get("feature_names", [])
+        if not feature_names:
+            return
+        feature_id_to_pos = {fid: pos for pos, fid in enumerate(feature_names)}
+        pos_indices = [feature_id_to_pos[fid] for fid in feature_ids if fid in feature_id_to_pos]
+
+        if self.current_canvas is not None and hasattr(self.current_canvas, "update_highlighting"):
+            self.current_canvas.update_highlighting(pos_indices)
+        if self.multi_volcano_widget is not None:
+            self.multi_volcano_widget.update_highlighting(pos_indices)
+
+        self._select_table_rows(feature_ids)
 
     def _on_view_feature_requested(self, feature_index: int, target: str):
         """Handle request to view feature in experiment results."""
         self.showFeatureInExperiment.emit(feature_index)
-
-    def _view_selected_feature(self):
-        """View the currently selected feature in experiment results."""
-        feature_id = self.features_table.get_current_feature_pair_id()
-        if feature_id is None:
-            QtWidgets.QMessageBox.information(self, "No Selection", "Please select a feature in the table first.")
-            return
-        self.showFeatureInExperiment.emit(feature_id)
 
     def _calculate_group_statistics(self, feature_ids: List[int], feature_names: List[int]) -> Dict[str, Dict[int, float]]:
         """Calculate mean, median, and SD for both groups in the current volcano comparison."""
