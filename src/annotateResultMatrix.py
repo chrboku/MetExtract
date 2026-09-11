@@ -12,6 +12,20 @@ from .utils import add_sheet_to_excel
 
 pp = pprint.PrettyPrinter(indent=1)
 
+_fT = formulaTools()
+
+
+def _formula_to_mass(formula):
+    """Compute the monoisotopic neutral mass of a sum-formula string (e.g. "C6H12O6"),
+    or return None if it cannot be parsed."""
+    if not formula:
+        return None
+    try:
+        elems, charge = _fT.parseFormulaWithCharge(str(formula))
+        return _fT.calcMolWeight(elems, charge=charge)
+    except Exception:
+        return None
+
 
 # defines a group (input data) for which statistic columns (_Stat_) are calculated
 def addGroup(to, groupName, minCount, cols):
@@ -475,11 +489,11 @@ def annotateWithDatabases(
                 "Feature_Average_peakarea": row_info["Feature_Average_peakarea"],
             }
 
-            # TODO implement
-            # Expand additionalInfo into individual columns with a DB_Info_ prefix
-            # for k, ks in all_additional_keys.items():
-            #    if ks not in compound_row:
-            #        compound_row[f"DB_Info_{ks}"] = sanitize_str(hit.additionalInfo.get(k, None))
+            # Expand additionalInfo (e.g. SMILES, InChI, ...) into individual columns with a DB_Info_ prefix
+            for k, ks in all_additional_keys.items():
+                col = f"DB_Info_{ks}"
+                if col not in compound_row:
+                    compound_row[col] = sanitize_str(hit.additionalInfo.get(k, None))
 
             # add compound row and new columns
             compound_rows.append(compound_row)
@@ -717,6 +731,36 @@ def annotateWithMSMSLibrary(
                             # store under the original key name
                             base_row[k] = lib_spec.metadata.get(k) if lib_spec.metadata is not None else None
 
+                    # Always resolve structure-related fields (SMILES/InChI/InChIKey/Formula), regardless
+                    # of the user's retain_keys selection, so structures can always be depicted for a match.
+                    if lib_spec is not None and lib_spec.metadata is not None:
+                        for k, v in mgfLibrary.resolve_structure_fields(lib_spec.metadata).items():
+                            if v is not None:
+                                base_row[k] = v
+
+                    # Theoretical (monoisotopic) mass of the resolved sum formula, for display
+                    # alongside the formula ("<formula> (<mass>)")
+                    formula = base_row.get("Formula")
+                    base_row["TheoreticalMass"] = _formula_to_mass(formula) if formula else None
+
+                    # Always resolve acquisition metadata of the library (reference) spectrum
+                    # (instrument, fragmentation mode, collision energy, RT), regardless of the
+                    # user's retain_keys selection.
+                    if lib_spec is not None and lib_spec.metadata is not None:
+                        for k, v in mgfLibrary.resolve_spectrum_meta_fields(lib_spec.metadata).items():
+                            base_row[f"Library_{k}"] = v
+                    base_row["Library_Precursor_MZ"] = lib_spec.precursor_mz if lib_spec is not None else None
+
+                    # Metadata of the matched EXPERIMENTAL scan (sample it came from, its own RT/
+                    # precursor m/z/fragmentation mode/collision energy), so a match can be traced
+                    # back to the exact scan it originated from.
+                    if isinstance(exp_spec, dict):
+                        base_row["Sample_File"] = exp_spec.get("sample_file")
+                        base_row["Scan_RT"] = exp_spec.get("retention_time_min")
+                        base_row["Scan_Precursor_MZ"] = exp_spec.get("precursor_mz")
+                        base_row["Scan_Fragmentation_Mode"] = exp_spec.get("fragmentation_mode")
+                        base_row["Scan_Collision_Energy"] = exp_spec.get("collision_energy")
+
                     # Add fragment counts for DB and experimental spectra
                     try:
                         base_row["DB_NumFragments"] = len(lib_spec.mz) if lib_spec is not None and hasattr(lib_spec, "mz") else None
@@ -774,6 +818,18 @@ def annotateWithMSMSLibrary(
             schema_overrides["DB_NumFragments"] = pl.Int64
         if any("Exp_NumFragments" in r for r in spectra_rows):
             schema_overrides["Exp_NumFragments"] = pl.Int64
+        if any("TheoreticalMass" in r for r in spectra_rows):
+            schema_overrides["TheoreticalMass"] = pl.Float64
+        if any("Library_RT" in r for r in spectra_rows):
+            schema_overrides["Library_RT"] = pl.Float64
+        if any("Library_Precursor_MZ" in r for r in spectra_rows):
+            schema_overrides["Library_Precursor_MZ"] = pl.Float64
+        if any("Scan_RT" in r for r in spectra_rows):
+            schema_overrides["Scan_RT"] = pl.Float64
+        if any("Scan_Precursor_MZ" in r for r in spectra_rows):
+            schema_overrides["Scan_Precursor_MZ"] = pl.Float64
+        if any("Scan_Collision_Energy" in r for r in spectra_rows):
+            schema_overrides["Scan_Collision_Energy"] = pl.Float64
 
         # Ensure all user-selected retain_keys are present as columns (even if empty)
         all_retain_keys = set()

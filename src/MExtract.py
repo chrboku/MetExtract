@@ -63,6 +63,10 @@ from .rawImport import UnsupportedFileError, prepare_import_files
 from .mePyGuis.PeakPickingSettingsDialog import PeakPickingSettingsDialog
 from .mePyGuis.ProgressWrapper import ProgressWrapper
 from .mePyGuis.RegExTestDialog import RegExTestDialog
+from .mePyGuis.annotationData import AnnotationStore
+from .mePyGuis.annotationPanel import FeatureAnnotationsPanel
+from .mePyGuis.annotationBrowser import AnnotationBrowserWidget
+from .mePyGuis.libraryCache import LibraryCache
 from .MetExtractII_Main import MetExtractVersion
 from .utils import (
     Bunch,
@@ -728,7 +732,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
         return self.checkedLCMSFiles[fhash].parsed
 
-    def updateLCMSSampleSettings(self):
+    def updateLCMSSampleSettings(self, switchPane=True):
         # fetch LC-HRMS data (polarity, filter-lines)
         self.ui.processedFilesComboBox.clear()
         self.ui.processedFilesComboBox.addItem("--", Bunch(file=None))
@@ -964,7 +968,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.ui.pickingTab.setEnabled(len(filterLines) > 0)
         hasProcessedFiles = self.ui.processedFilesComboBox.count() > 0
         self.ui.resultsTab.setEnabled(hasProcessedFiles)
-        if hasProcessedFiles:
+        if hasProcessedFiles and switchPane:
             # The group file being loaded already has processed files: auto-open the pane
             self._showDockPane("resultsTab")
 
@@ -1656,7 +1660,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 color=str(tdiag.getGroupColor()),
             )
 
-            if self.updateLCMSSampleSettings():
+            if self.updateLCMSSampleSettings(switchPane=False):
                 self.grpFileEdited = True
 
     # remove selected groups from the input
@@ -1667,7 +1671,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         for row in selectedRows:
             self.ui.groupsList.removeRow(row)
 
-        self.updateLCMSSampleSettings()
+        self.updateLCMSSampleSettings(switchPane=False)
         self.grpFileEdited = True
 
     # Double-click on files column opens group-edit dialog; name/minFound remain inline-editable
@@ -1706,7 +1710,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 processingLevel=grp.processingLevel,
                 atPos=row,
             )
-            self.updateLCMSSampleSettings()
+            self.updateLCMSSampleSettings(switchPane=False)
             self.grpFileEdited = True
 
     def _onGroupTableItemChanged(self, item):
@@ -2115,6 +2119,12 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 self.experimentResults.selected_table = selected_table
                 group_results_df = self.experimentResults.db_con.tables[selected_table]
 
+                self.experimentResults.annotation_store = AnnotationStore(self.experimentResults.db_con, main_table_name=selected_table)
+                self.experimentResults.library_cache = LibraryCache(self.experimentResults.db_con)
+                self.ui.annotationBrowserWidget.load(self.experimentResults.annotation_store)
+                if self.ui.annotationBrowserWidget.tree.topLevelItemCount() > 0:
+                    self._showDockPane("annotationBrowserTab")
+
                 # Populate the grouping-column selector with the data-matrix columns,
                 # defaulting to "OGroup" (without triggering a redundant tree rebuild).
                 self.ui.comboBox_expGroupingColumn.blockSignals(True)
@@ -2125,6 +2135,9 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 self.ui.comboBox_expGroupingColumn.blockSignals(False)
 
                 self._buildExperimentResultsTree(group_results_df, selected_table)
+
+                # Automatically switch to the "Experiment results" pane once results are loaded
+                self._showDockPane("bracketedResultsTab")
 
         except Exception as e:
             traceback.print_exc()
@@ -3039,6 +3052,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             self.updateSamplePeaksTab([])
             self.updateIsotopicPatternTab([])
             self._syncStatisticsFeatureHighlight([])
+            self.ui.featureAnnotationsPanel.clear()
             return
 
         if len(self.ui.resultsExperiment_TreeWidget.selectedItems()) == 0:
@@ -3048,6 +3062,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             self.drawCanvas(self.ui.resultsExperimentAbundance_plot, showLegendOverwrite=False)
             self.drawCanvas(self.ui.resultsExperimentIsotopicPattern_plot, showLegendOverwrite=False)
             self.updateSamplePeaksTab([])
+            self.ui.featureAnnotationsPanel.clear()
             self.updateIsotopicPatternTab([])
             self._syncStatisticsFeatureHighlight([])
             return
@@ -3056,6 +3071,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self._syncStatisticsFeatureHighlight(plotItems)
         self.updateExperimentAbundancePlot(plotItems)
         self.updateIsotopicPatternTab(plotItems)
+        self._updateFeatureAnnotationsPanel(plotItems)
 
         # Load raw mzXML files if not already loaded
         if not hasattr(self, "loadedMZXMLs") or self.loadedMZXMLs is None:
@@ -11459,12 +11475,22 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                     if len(ms2_scan.mz_list) == 0:
                         continue
 
+                    sample_file = os.path.basename(file_key)
+                    for ext in (".mzxml", ".mzml"):
+                        if sample_file.lower().endswith(ext):
+                            sample_file = sample_file[: -len(ext)]
+                            break
+
                     msms_by_feature.setdefault(num, []).append(
                         {
                             "mz": ms2_scan.mz_list,
                             "intensities": ms2_scan.intensity_list,
                             "polarity": ms2_scan.polarity,
                             "precursor_mz": ms2_scan.precursor_mz,
+                            "sample_file": sample_file,
+                            "retention_time_min": ms2_scan.retention_time / 60.0,
+                            "fragmentation_mode": getattr(ms2_scan, "activationMethod", "") or None,
+                            "collision_energy": getattr(ms2_scan, "collisionEnergy", None),
                         }
                     )
 
@@ -16929,7 +16955,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                                     color=color,
                                     useAsMSMSTarget=False,
                                 )
-                            self.updateLCMSSampleSettings()
+                            self.updateLCMSSampleSettings(switchPane=False)
                             self.grpFileEdited = True
                     else:
                         self.showAddGroupDialog(initWithFiles=links)
@@ -17493,6 +17519,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             ("resultsTab", "Sample results", self.ui.resultsTab, False),
             ("bracketedResultsTab", "Experiment results", self.ui.bracketedResultsTab, False),
             ("statisticsTab", "Statistics", self.ui.statisticsTab, False),
+            ("annotationBrowserTab", "Annotation browser", self._createAnnotationBrowserPage(), False),
         ]
 
         self._dockWidgets = {}
@@ -17532,6 +17559,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self._wrapRowInCollapsibleFlowLayout(self.ui.horizontalLayout_abundance_controls, "visualization options")
         self._wrapRowInCollapsibleFlowLayout(self.ui.horizontalLayout_isotopic_pattern_controls, "visualization options")
         self._rearrangeIsotopicPatternPanel()
+        self._addFeatureAnnotationsTab()
 
         # "Abundance profiles"/"Separated peaks" plots inherited their min width from a
         # much wider (pre-split/pre-side-by-side) layout; shrink it to 30% so all three
@@ -17550,6 +17578,46 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         splitter.setStretchFactor(0, 7)
         splitter.setStretchFactor(1, 3)
         splitter.setSizes([700, 300])
+
+    def _createAnnotationBrowserPage(self):
+        """Build the "Annotation browser" top-level dock page: an experiment-wide,
+        annotation-centric tree (Type -> Library/Database -> Compound -> Feature).
+        """
+        self.ui.annotationBrowserWidget = AnnotationBrowserWidget()
+        self.ui.annotationBrowserWidget.featureSelected.connect(self._showFeatureInExperimentResults)
+        return self.ui.annotationBrowserWidget
+
+    def _addFeatureAnnotationsTab(self):
+        """Add the "Feature annotations" panel (MS/MS-, database- and sum-formula hits of
+        whichever feature is selected in the "Experiment results" tree) as a new tab page
+        inside the "Experiment results" pane's own tab strip, before it gets converted into
+        a nested dock area.
+        """
+        self.ui.featureAnnotationsPanel = FeatureAnnotationsPanel()
+        self.ui.featureAnnotationsPanel.configure(get_experimental_scan=self._getRepresentativeMSMSScanForFeature)
+        self.ui.tabWidget_3.addTab(self.ui.featureAnnotationsPanel, "Feature annotations")
+
+    def _getRepresentativeMSMSScanForFeature(self, feature_num):
+        """Return the highest-precursor-intensity experimental MS2 scan already matched to
+        *feature_num* (native or labeled, whichever is more intense), for use in the
+        "Feature annotations" panel's MS/MS mirror plot. Returns None if unavailable."""
+        try:
+            candidates = [r["scan"] for r in self._iter_exp_msms_rows() if r.get("feature_num") == feature_num]
+        except Exception:
+            return None
+        if not candidates:
+            return None
+        return max(candidates, key=lambda scan: float(getattr(scan, "precursor_intensity", 0.0)))
+
+    def _updateFeatureAnnotationsPanel(self, plotItems):
+        """Refresh the "Feature annotations" panel for the single currently-selected feature
+        (cleared if zero or more than one feature is selected, or no annotation sheets exist)."""
+        store = getattr(self.experimentResults, "annotation_store", None) if hasattr(self, "experimentResults") else None
+        if store is None or len(plotItems) != 1 or getattr(plotItems[0], "id", None) is None:
+            self.ui.featureAnnotationsPanel.clear()
+            return
+        library_cache = getattr(self.experimentResults, "library_cache", None)
+        self.ui.featureAnnotationsPanel.show_feature(plotItems[0].id, store, library_cache)
 
     def _convertTabWidgetToDockArea(self, tabWidget, arrange=None):
         """Replace *tabWidget* in-place with an embedded QMainWindow whose dock widgets
@@ -17716,7 +17784,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         """Add a "View" menu that lets the user re-open any closed/hidden pane."""
         self.ui.menuView = QtWidgets.QMenu(self.ui.menuBar)
         self.ui.menuView.setTitle("View")
-        for objName in ("inputTab", "pickingTab", "resultsTab", "bracketedResultsTab", "statisticsTab"):
+        for objName in ("inputTab", "pickingTab", "resultsTab", "bracketedResultsTab", "statisticsTab", "annotationBrowserTab"):
             action = self._dockWidgets[objName].toggleViewAction()
             self.ui.menuView.addAction(action)
         # Insert "View" right after "File" (before "Tools")

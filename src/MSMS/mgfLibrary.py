@@ -103,6 +103,39 @@ def _find_by_last_segment(metadata, candidates):
     return None
 
 
+def resolve_structure_fields(metadata):
+    """
+    Look up chemical-structure-related fields (SMILES, InChI, InChIKey, sum formula) in a
+    (possibly flattened) library spectrum metadata dict, regardless of the exact field name
+    used by the library file, so structures can always be depicted for a match.
+
+    Returns a dict with keys "SMILES", "InChI", "InChIKey", "Formula" (value None if not found).
+    """
+    return {
+        "SMILES": _find_by_last_segment(metadata, {"smiles", "ch$smiles"}),
+        "InChI": _find_by_last_segment(metadata, {"inchi", "ch$iupac"}),
+        "InChIKey": _find_by_last_segment(metadata, {"inchikey", "inchi_key"}),
+        "Formula": _find_by_last_segment(metadata, {"formula", "ch$formula", "molecular_formula"}),
+    }
+
+
+def resolve_spectrum_meta_fields(metadata):
+    """
+    Look up acquisition-related metadata fields (instrument, fragmentation mode, collision
+    energy, retention time) of a library reference spectrum, regardless of the exact field
+    name used by the library file, so this information can always be shown for a match.
+
+    Returns a dict with keys "Instrument", "Fragmentation_Mode", "Collision_Energy", "RT"
+    (value None if not found).
+    """
+    return {
+        "Instrument": _find_by_last_segment(metadata, {"instrument", "instrument_type", "ac$instrument", "ac$instrument_type"}),
+        "Fragmentation_Mode": _find_by_last_segment(metadata, {"fragmentation_mode", "ac$mass_spectrometry", "activation_method", "ionization_mode"}),
+        "Collision_Energy": _find_by_last_segment(metadata, {"collision_energy", "ac$mass_spectrometry_collision_energy"}),
+        "RT": _parse_float_field(_find_by_last_segment(metadata, {"retention_time", "rt", "rtinseconds"})),
+    }
+
+
 def _parse_float_field(value):
     """Parse a (possibly multi-token, e.g. MGF PEPMASS "mz intensity") field into a float."""
     if value is None:

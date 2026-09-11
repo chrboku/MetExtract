@@ -61,7 +61,14 @@ SHEET_DESCRIPTIONS = [
     _entry(
         "5_Annotated_MSMS",
         "One row per MS/MS spectrum hit (spectrum-centric view of '5_Annotated').",
-        "Flattened view of the MS/MS spectra search results: each row is a single MS/MS spectrum hit together with the feature it was found in ('Feature_*' columns).",
+        "Flattened view of the MS/MS spectra search results: each row is a single MS/MS spectrum hit "
+        "with 'Library'/'Score'/'Matched_Fragments'/'Compound_Name'/'Compound_ID' describing the match "
+        "itself; auto-resolved 'SMILES'/'InChI'/'InChIKey'/'Formula'/'TheoreticalMass' and "
+        "'Library_Instrument'/'Library_Fragmentation_Mode'/'Library_Collision_Energy'/'Library_RT'/"
+        "'Library_Precursor_MZ' describing the matched reference (library) spectrum; "
+        "'Sample_File'/'Scan_RT'/'Scan_Precursor_MZ'/'Scan_Fragmentation_Mode'/'Scan_Collision_Energy' "
+        "describing the experimental scan the match was found in; and 'Feature_*' columns identifying "
+        "the feature it was found in.",
     ),
     _entry(
         "0_sampleStats",
@@ -446,7 +453,9 @@ ANNOTATED_DATABASES_DETAIL = [
         "One row per individual database hit across all features, with columns: 'DB_Name' (database the "
         "hit came from), 'DB_Num' (entry id in that database), 'DB_CompoundName', 'DB_SumFormula', "
         "'DB_Mass', 'DB_RT_min', 'DB_MZ', 'DB_Polarity', 'HitType' (mass-only vs. mass+RT), "
-        "'MatchErrorPPM', 'MatchErrorMass' describing the database hit itself; and 'Feature_Num', "
+        "'MatchErrorPPM', 'MatchErrorMass' describing the database hit itself; 'DB_Info_<field>' columns "
+        "(one per additional field present in the imported database file, e.g. 'DB_Info_SMILES', "
+        "'DB_Info_InChI') holding that database entry's extra metadata; and 'Feature_Num', "
         "'Feature_OGroup', 'Feature_RT', 'Feature_MZ', 'Feature_Xn', 'Feature_Ionisation_Mode', "
         "'Feature_Charge', 'Feature_M', 'Feature_Ion', 'Feature_Loss', "
         "'Feature_Relative_peakarea_in_group', 'Feature_Average_peakarea' identifying the feature "
