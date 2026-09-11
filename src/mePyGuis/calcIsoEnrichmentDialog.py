@@ -1,14 +1,6 @@
-from math import factorial
 from PySide6 import QtWidgets
 from .calcIsotopeEnrichmentDialog import Ui_Dialog
-
-
-def choose(n, r):
-    return factorial(n) // factorial(r) // factorial(n - r)
-
-
-def calcIsoEnrichment(a, s, r):
-    return choose(a, s) ** (1.0 / s) / (choose(a, s) ** (1.0 / s) + r ** (1.0 / s))
+from ..formulaTools import calcIsoEnrichment
 
 
 class calcIsoEnrichmentDialog(QtWidgets.QDialog, Ui_Dialog):

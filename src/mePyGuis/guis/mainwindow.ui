@@ -3690,12 +3690,49 @@ font: 7pt;</string>
                     <bool>true</bool>
                    </property>
                    <layout class="QGridLayout" name="gridLayout_51">
-                    <item row="1" column="0">
-                     <widget class="QCheckBox" name="checkRTInHits_checkBox">
-                      <property name="text">
-                       <string>Check retention time</string>
-                      </property>
-                     </widget>
+                    <item row="1" column="0" colspan="7">
+                     <layout class="QHBoxLayout" name="horizontalLayout_checkRT">
+                      <item>
+                       <widget class="QCheckBox" name="checkRTInHits_checkBox">
+                        <property name="text">
+                         <string>Check retention time</string>
+                        </property>
+                       </widget>
+                      </item>
+                      <item>
+                       <widget class="QLabel" name="label_79">
+                        <property name="text">
+                         <string>Maximum retention time deviation</string>
+                        </property>
+                       </widget>
+                      </item>
+                      <item>
+                       <widget class="QDoubleSpinBox" name="maxRTErrorInHits_spinnerBox">
+                        <property name="prefix">
+                         <string>± </string>
+                        </property>
+                        <property name="suffix">
+                         <string> minutes</string>
+                        </property>
+                        <property name="value">
+                         <double>0.150000000000000</double>
+                        </property>
+                       </widget>
+                      </item>
+                      <item>
+                       <spacer name="horizontalSpacer_4">
+                        <property name="orientation">
+                         <enum>Qt::Horizontal</enum>
+                        </property>
+                        <property name="sizeHint" stdset="0">
+                         <size>
+                          <width>40</width>
+                          <height>20</height>
+                         </size>
+                        </property>
+                       </spacer>
+                      </item>
+                     </layout>
                     </item>
                     <item row="3" column="0" colspan="7">
                      <layout class="QHBoxLayout" name="horizontalLayout_23">
@@ -3774,43 +3811,7 @@ font: 7pt;</string>
                       </property>
                      </widget>
                     </item>
-                    <item row="1" column="1">
-                     <layout class="QHBoxLayout" name="horizontalLayout_11">
-                      <item>
-                       <widget class="QLabel" name="label_79">
-                        <property name="text">
-                         <string>Maximum retention time deviation</string>
-                        </property>
-                       </widget>
-                      </item>
-                      <item>
-                       <widget class="QDoubleSpinBox" name="maxRTErrorInHits_spinnerBox">
-                        <property name="prefix">
-                         <string>± </string>
-                        </property>
-                        <property name="suffix">
-                         <string> minutes</string>
-                        </property>
-                        <property name="value">
-                         <double>0.150000000000000</double>
-                        </property>
-                       </widget>
-                      </item>
-                      <item>
-                       <spacer name="horizontalSpacer_4">
-                        <property name="orientation">
-                         <enum>Qt::Horizontal</enum>
-                        </property>
-                        <property name="sizeHint" stdset="0">
-                         <size>
-                          <width>40</width>
-                          <height>20</height>
-                         </size>
-                        </property>
-                       </spacer>
-                      </item>
-                     </layout>
-                    </item>
+
                     <item row="2" column="0" colspan="2">
                      <layout class="QHBoxLayout" name="horizontalLayout_20">
                       <item>
@@ -4340,6 +4341,39 @@ font: 7pt;</string>
                        <widget class="QCheckBox" name="useSILRatioForConvolution">
                         <property name="text">
                          <string>Use SIL ratio</string>
+                        </property>
+                       </widget>
+                      </item>
+                      <item>
+                       <widget class="QCheckBox" name="useAbundanceSimilarityForConvolution">
+                        <property name="text">
+                         <string>Use abundance similarity</string>
+                        </property>
+                        <property name="checked">
+                         <bool>true</bool>
+                        </property>
+                       </widget>
+                      </item>
+                      <item>
+                       <widget class="QLabel" name="label_122">
+                        <property name="text">
+                         <string>Abundance similarity threshold</string>
+                        </property>
+                       </widget>
+                      </item>
+                      <item>
+                       <widget class="QDoubleSpinBox" name="abundanceSimilarityThreshold">
+                        <property name="prefix">
+                         <string>≥ </string>
+                        </property>
+                        <property name="suffix">
+                         <string> %</string>
+                        </property>
+                        <property name="maximum">
+                         <double>100.000000000000000</double>
+                        </property>
+                        <property name="value">
+                         <double>85.000000000000000</double>
                         </property>
                        </widget>
                       </item>
@@ -5742,6 +5776,114 @@ font: 7pt;</string>
                 </item>
                </layout>
               </widget>
+              <widget class="QWidget" name="tab_abundance_profiles">
+               <attribute name="title">
+                <string>Abundance profiles</string>
+               </attribute>
+               <layout class="QGridLayout" name="gridLayout_abundance_profiles">
+                <item row="0" column="0">
+                 <layout class="QHBoxLayout" name="horizontalLayout_abundance_controls">
+                  <item>
+                   <widget class="QLabel" name="label_abundance_visualization">
+                    <property name="text">
+                     <string>Visualization</string>
+                    </property>
+                   </widget>
+                  </item>
+                  <item>
+                   <widget class="QComboBox" name="comboBox_abundancePlotType">
+                    <item>
+                     <property name="text">
+                      <string>Boxplot</string>
+                     </property>
+                    </item>
+                    <item>
+                     <property name="text">
+                      <string>Line plot</string>
+                     </property>
+                    </item>
+                   </widget>
+                  </item>
+                  <item>
+                   <widget class="QLabel" name="label_abundance_scale">
+                    <property name="text">
+                     <string>Scale</string>
+                    </property>
+                   </widget>
+                  </item>
+                  <item>
+                   <widget class="QComboBox" name="comboBox_abundanceScale">
+                    <item>
+                     <property name="text">
+                      <string>Linear</string>
+                     </property>
+                    </item>
+                    <item>
+                     <property name="text">
+                      <string>Logarithmic</string>
+                     </property>
+                    </item>
+                   </widget>
+                  </item>
+                  <item>
+                   <widget class="QLabel" name="label_abundance_scaling">
+                    <property name="text">
+                     <string>Normalization</string>
+                    </property>
+                   </widget>
+                  </item>
+                  <item>
+                   <widget class="QComboBox" name="comboBox_abundanceScalingMode">
+                    <item>
+                     <property name="text">
+                      <string>None</string>
+                     </property>
+                    </item>
+                    <item>
+                     <property name="text">
+                      <string>Scale to max sample</string>
+                     </property>
+                    </item>
+                    <item>
+                     <property name="text">
+                      <string>Scale to max experimental group</string>
+                     </property>
+                    </item>
+                   </widget>
+                  </item>
+                  <item>
+                   <spacer name="horizontalSpacer_abundance">
+                    <property name="orientation">
+                     <enum>Qt::Horizontal</enum>
+                    </property>
+                    <property name="sizeHint" stdset="0">
+                     <size>
+                      <width>40</width>
+                      <height>20</height>
+                     </size>
+                    </property>
+                   </spacer>
+                  </item>
+                 </layout>
+                </item>
+                <item row="1" column="0">
+                 <widget class="QWidget" name="resultsExperimentAbundance_widget" native="true">
+                  <property name="sizePolicy">
+                   <sizepolicy hsizetype="Preferred" vsizetype="Expanding">
+                    <horstretch>0</horstretch>
+                    <verstretch>0</verstretch>
+                   </sizepolicy>
+                  </property>
+                  <property name="minimumSize">
+                   <size>
+                    <width>700</width>
+                    <height>500</height>
+                   </size>
+                  </property>
+                 </widget>
+                </item>
+               </layout>
+              </widget>
              </widget>
             </item>
            </layout>
@@ -5926,6 +6068,8 @@ font: 7pt;</string>
   <tabstop>polynomValue</tabstop>
   <tabstop>minConnectionRate</tabstop>
   <tabstop>metaboliteClusterMinConnections</tabstop>
+  <tabstop>useAbundanceSimilarityForConvolution</tabstop>
+  <tabstop>abundanceSimilarityThreshold</tabstop>
   <tabstop>integratedMissedPeaks</tabstop>
   <tabstop>integrationMaxTimeDifference</tabstop>
   <tabstop>reintegrateIntensityCutoff</tabstop>

@@ -1,17 +1,20 @@
 from __future__ import absolute_import, division, print_function
 import base64
 import datetime
+import hashlib
 import json
 import logging
 import os
 import statistics
 import time
 import uuid
+import xml.etree.ElementTree as _ET
 from collections import OrderedDict, defaultdict
-from math import isnan
+from math import isnan, log
 from multiprocessing import Manager, Pool
 from operator import itemgetter
 from pickle import loads as pickle_loads
+import numpy as np
 import polars as pl
 from reportlab.graphics import renderPDF
 from reportlab.graphics.charts.lineplots import LinePlot
@@ -22,6 +25,7 @@ from . import HCA_general, exportAsFeatureML
 from .Chromatogram import Chromatogram
 from .MZHCA import HierarchicalClustering, cutTreeSized
 from .PolarsDB import PolarsDB
+from .metaboliteGrouping import split_group_by_relative_abundance
 from .utils import ChromPeakPair
 from .utils import (
     Bunch,
@@ -34,7 +38,56 @@ from .utils import (
     sd,
 )
 from .XICAlignment import XICAlignment
-from .utils import mapArrayToRefTimes
+from .utils import mapArrayToRefTimes, get_app_folder
+from .resultsPostProcessing.helpSheet import generate_help_sheet
+
+
+def log10(x):
+    return log(x, 10)
+
+
+# ---------------------------------------------------------------------------
+# Per-file sample-stats cache helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_stats_cache_dir():
+    cache_dir = os.path.join(get_app_folder(), "sampleStats")
+    os.makedirs(cache_dir, exist_ok=True)
+    return cache_dir
+
+
+def _load_cached_stats(filepath, scan_event_key):
+    """Return cached stats dict for *filepath* or None if missing / stale."""
+    try:
+        fp = os.path.abspath(filepath)
+        key = hashlib.md5(fp.encode("utf-8")).hexdigest()
+        cache_path = os.path.join(_get_stats_cache_dir(), f"{key}.json")
+        if not os.path.exists(cache_path):
+            return None
+        mtime = os.path.getmtime(fp)
+        with open(cache_path, "r", encoding="utf-8") as fh:
+            cached = json.load(fh)
+        if cached.get("_mtime") != mtime:
+            return None
+        if cached.get("_scan_event_key") != scan_event_key:
+            return None
+        return cached.get("data")
+    except Exception:
+        return None
+
+
+def _save_cached_stats(filepath, data, scan_event_key):
+    """Write stats dict to the per-file cache."""
+    try:
+        fp = os.path.abspath(filepath)
+        key = hashlib.md5(fp.encode("utf-8")).hexdigest()
+        cache_path = os.path.join(_get_stats_cache_dir(), f"{key}.json")
+        mtime = os.path.getmtime(fp)
+        with open(cache_path, "w", encoding="utf-8") as fh:
+            json.dump({"_mtime": mtime, "_scan_event_key": scan_event_key, "data": data}, fh)
+    except Exception as e:
+        logging.debug(f"Could not save stats cache for {filepath}: {e}")
 
 
 # HELPER METHOD for writing first page of PDF (unused)
@@ -115,6 +168,204 @@ def writeConfigToDB(
     db.insert_row("config", {"key": "FPBRACK_file", "value": str(file)})
     db.insert_row("config", {"key": "FPBRACK_align", "value": str(align)})
     db.insert_row("config", {"key": "FPBRACK_nPolynom", "value": str(nPolynom)})
+
+
+def _get_mzml_metadata(filepath):
+    """Extract startTimeStamp and specific cvParams from an mzML header via streaming XML parsing."""
+    result = {"startTimeStamp": None, "MS:1000073": None, "MS:1000079": None}
+    ns = {"mzml": "http://psi.hupo.org/ms/mzml"}
+    try:
+        for event, elem in _ET.iterparse(filepath, events=("start",)):
+            tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+            if tag == "run":
+                result["startTimeStamp"] = elem.get("startTimeStamp")
+            elif tag == "cvParam":
+                acc = elem.get("accession", "")
+                if acc in ("MS:1000073", "MS:1000079"):
+                    result[acc] = elem.get("name", acc)
+            # Stop after the first spectrum to avoid reading the whole file
+            elif tag == "spectrum":
+                break
+    except Exception as e:
+        logging.debug(f"Could not parse mzML metadata from {filepath}: {e}")
+    return result
+
+
+def _percentile_stats(diffs):
+    """Return a dict of percentile statistics for a list of float values."""
+    if not diffs:
+        return {k: None for k in ("min", "p10", "p25", "median", "mean", "p75", "p90", "max", "sd")}
+    arr = np.array(diffs, dtype=float)
+    return {
+        "min": float(np.min(arr)),
+        "p10": float(np.percentile(arr, 10)),
+        "p25": float(np.percentile(arr, 25)),
+        "median": float(np.median(arr)),
+        "mean": float(np.mean(arr)),
+        "p75": float(np.percentile(arr, 75)),
+        "p90": float(np.percentile(arr, 90)),
+        "max": float(np.max(arr)),
+        "sd": float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0,
+    }
+
+
+def _intensity_percentile_stats(intensities):
+    """Return intensity distribution stats (min, p10, p25, median, p75, p90–p99, max)."""
+    _keys = ("min", "p10", "p25", "median", "p75", "p90", "p91", "p92", "p93", "p94", "p95", "p96", "p97", "p98", "p99", "max")
+    if not intensities:
+        return {k: None for k in _keys}
+    arr = np.array(intensities, dtype=float)
+    return {
+        "min": float(np.min(arr)),
+        "p10": float(np.percentile(arr, 10)),
+        "p25": float(np.percentile(arr, 25)),
+        "median": float(np.median(arr)),
+        "p75": float(np.percentile(arr, 75)),
+        "p90": float(np.percentile(arr, 90)),
+        "p91": float(np.percentile(arr, 91)),
+        "p92": float(np.percentile(arr, 92)),
+        "p93": float(np.percentile(arr, 93)),
+        "p94": float(np.percentile(arr, 94)),
+        "p95": float(np.percentile(arr, 95)),
+        "p96": float(np.percentile(arr, 96)),
+        "p97": float(np.percentile(arr, 97)),
+        "p98": float(np.percentile(arr, 98)),
+        "p99": float(np.percentile(arr, 99)),
+        "max": float(np.max(arr)),
+    }
+
+
+def compute_sample_stats(all_files, positiveScanEvent=None, negativeScanEvent=None):
+    """Compute per-file sample statistics for a list of raw LC-MS/MS files.
+
+    Returns a list of dicts, one per file, with keys:
+        file, ms1_pos, ms1_neg, ms2_pos, ms2_neg, last_rt,
+        ms1_timediff_*, ms2_timediff_*,
+        startTimeStamp, MS:1000073, MS:1000079
+    """
+    rows = []
+    for filepath in all_files:
+        filepath = str(filepath).replace("\\", "/")
+        # v3: compute MS1 intensity stats from actual signal data (intensity_list)
+        scan_event_key = f"{positiveScanEvent}|{negativeScanEvent}|v6"
+
+        # Try cache first
+        cached_row = _load_cached_stats(filepath, scan_event_key)
+        if cached_row is not None:
+            rows.append(cached_row)
+            continue
+
+        try:
+            chrom = Chromatogram()
+            chrom.parse_file(filepath, ignoreCharacterData=False)
+        except Exception as e:
+            logging.warning(f"compute_sample_stats: could not parse {filepath}: {e}")
+            rows.append({"file": os.path.basename(filepath)})
+            continue
+
+        pos_se = positiveScanEvent if positiveScanEvent and positiveScanEvent != "None" else None
+        neg_se = negativeScanEvent if negativeScanEvent and negativeScanEvent != "None" else None
+
+        # MS1 scan counts per polarity / selected scan event
+        ms1_pos_scans = [s for s in chrom.MS1_list if s.polarity == "+" and (pos_se is None or s.filter_line == pos_se)]
+        ms1_neg_scans = [s for s in chrom.MS1_list if s.polarity == "-" and (neg_se is None or s.filter_line == neg_se)]
+        ms1_pos = len(ms1_pos_scans)
+        ms1_neg = len(ms1_neg_scans)
+
+        # MS2 scan counts per polarity
+        ms2_pos = sum(1 for s in chrom.MS2_list if s.polarity == "+")
+        ms2_neg = sum(1 for s in chrom.MS2_list if s.polarity == "-")
+
+        # Adjacent MS1 time differences (selected scan events only)
+        ms1_times = sorted(s.retention_time for s in chrom.MS1_list if (pos_se is None or s.filter_line == pos_se or s.polarity == "+") and (neg_se is None or s.filter_line == neg_se or s.polarity == "-"))
+        if pos_se:
+            ms1_times = sorted(s.retention_time for s in chrom.MS1_list if s.filter_line == pos_se or s.filter_line == neg_se)
+        ms1_diffs = [ms1_times[i + 1] - ms1_times[i] for i in range(len(ms1_times) - 1)]
+
+        # Adjacent MS2 time differences
+        ms2_times = sorted(s.retention_time for s in chrom.MS2_list)
+        ms2_diffs = [ms2_times[i + 1] - ms2_times[i] for i in range(len(ms2_times) - 1)]
+
+        # Last scan RT (max of all scans)
+        all_rts = [s.retention_time for s in chrom.MS1_list] + [s.retention_time for s in chrom.MS2_list]
+        last_rt = max(all_rts) / 60.0 if all_rts else None
+
+        ms1_stats = _percentile_stats(ms1_diffs)
+        ms2_stats = _percentile_stats(ms2_diffs)
+
+        # Collect ALL individual signal intensities from the actual peak lists
+        ms1_signalInt_pos = _intensity_percentile_stats([log10(v) for s in ms1_pos_scans for v in s.intensity_list.tolist()])
+        ms1_signalInt_neg = _intensity_percentile_stats([log10(v) for s in ms1_neg_scans for v in s.intensity_list.tolist()])
+
+        # mzML-specific metadata
+        mzml_meta = {"startTimeStamp": None, "MS:1000073": None, "MS:1000079": None}
+        if filepath.lower().endswith(".mzml"):
+            mzml_meta = _get_mzml_metadata(filepath)
+
+        row = {
+            "file": os.path.basename(filepath),
+            "startTimeStamp": mzml_meta["startTimeStamp"],
+            "ms1_pos": ms1_pos,
+            "ms1_neg": ms1_neg,
+            "ms2_pos": ms2_pos,
+            "ms2_neg": ms2_neg,
+            "last_rt_min": last_rt,
+            "ms1_dt_min": ms1_stats["min"],
+            "ms1_dt_p10": ms1_stats["p10"],
+            "ms1_dt_p25": ms1_stats["p25"],
+            "ms1_dt_median": ms1_stats["median"],
+            "ms1_dt_mean": ms1_stats["mean"],
+            "ms1_dt_p75": ms1_stats["p75"],
+            "ms1_dt_p90": ms1_stats["p90"],
+            "ms1_dt_max": ms1_stats["max"],
+            "ms1_dt_sd": ms1_stats["sd"],
+            "ms2_dt_min": ms2_stats["min"],
+            "ms2_dt_p10": ms2_stats["p10"],
+            "ms2_dt_p25": ms2_stats["p25"],
+            "ms2_dt_median": ms2_stats["median"],
+            "ms2_dt_mean": ms2_stats["mean"],
+            "ms2_dt_p75": ms2_stats["p75"],
+            "ms2_dt_p90": ms2_stats["p90"],
+            "ms2_dt_max": ms2_stats["max"],
+            "ms2_dt_sd": ms2_stats["sd"],
+            "ms1_signalInt_pos_min": ms1_signalInt_pos["min"],
+            "ms1_signalInt_pos_p10": ms1_signalInt_pos["p10"],
+            "ms1_signalInt_pos_p25": ms1_signalInt_pos["p25"],
+            "ms1_signalInt_pos_median": ms1_signalInt_pos["median"],
+            "ms1_signalInt_pos_p75": ms1_signalInt_pos["p75"],
+            "ms1_signalInt_pos_p90": ms1_signalInt_pos["p90"],
+            "ms1_signalInt_pos_p91": ms1_signalInt_pos["p91"],
+            "ms1_signalInt_pos_p92": ms1_signalInt_pos["p92"],
+            "ms1_signalInt_pos_p93": ms1_signalInt_pos["p93"],
+            "ms1_signalInt_pos_p94": ms1_signalInt_pos["p94"],
+            "ms1_signalInt_pos_p95": ms1_signalInt_pos["p95"],
+            "ms1_signalInt_pos_p96": ms1_signalInt_pos["p96"],
+            "ms1_signalInt_pos_p97": ms1_signalInt_pos["p97"],
+            "ms1_signalInt_pos_p98": ms1_signalInt_pos["p98"],
+            "ms1_signalInt_pos_p99": ms1_signalInt_pos["p99"],
+            "ms1_signalInt_pos_max": ms1_signalInt_pos["max"],
+            "ms1_signalInt_neg_min": ms1_signalInt_neg["min"],
+            "ms1_signalInt_neg_p10": ms1_signalInt_neg["p10"],
+            "ms1_signalInt_neg_p25": ms1_signalInt_neg["p25"],
+            "ms1_signalInt_neg_median": ms1_signalInt_neg["median"],
+            "ms1_signalInt_neg_p75": ms1_signalInt_neg["p75"],
+            "ms1_signalInt_neg_p90": ms1_signalInt_neg["p90"],
+            "ms1_signalInt_neg_p91": ms1_signalInt_neg["p91"],
+            "ms1_signalInt_neg_p92": ms1_signalInt_neg["p92"],
+            "ms1_signalInt_neg_p93": ms1_signalInt_neg["p93"],
+            "ms1_signalInt_neg_p94": ms1_signalInt_neg["p94"],
+            "ms1_signalInt_neg_p95": ms1_signalInt_neg["p95"],
+            "ms1_signalInt_neg_p96": ms1_signalInt_neg["p96"],
+            "ms1_signalInt_neg_p97": ms1_signalInt_neg["p97"],
+            "ms1_signalInt_neg_p98": ms1_signalInt_neg["p98"],
+            "ms1_signalInt_neg_p99": ms1_signalInt_neg["p99"],
+            "ms1_signalInt_neg_max": ms1_signalInt_neg["max"],
+            "MS:1000073": mzml_meta["MS:1000073"],
+            "MS:1000079": mzml_meta["MS:1000079"],
+        }
+        _save_cached_stats(filepath, row, scan_event_key)
+        rows.append(row)
+    return rows
 
 
 # bracket results
@@ -205,8 +456,8 @@ def bracketResults(
         excel_data["Tracer"] = []
 
         excel_data_dTypes = OrderedDict()
-        excel_data_dTypes["Num"] = pl.Int64
-        excel_data_dTypes["OGroup"] = pl.Int64
+        excel_data_dTypes["Num"] = pl.Utf8
+        excel_data_dTypes["OGroup"] = pl.Utf8
         excel_data_dTypes["Relative_peakarea_in_group"] = pl.Float64
         excel_data_dTypes["Average_peakarea"] = pl.Float64
         excel_data_dTypes["Comment"] = pl.Utf8
@@ -264,6 +515,9 @@ def bracketResults(
             excel_data[fname + "_FID"] = []
             excel_data[fname + "_GroupID"] = []
             excel_data[fname + "_isotopologRatios"] = []
+            excel_data[fname + "_isoArea"] = []
+            excel_data[fname + "_isoEnrichment"] = []
+            excel_data[fname + "_isoCount"] = []
 
             excel_data_dTypes[fname + "_Found"] = pl.Utf8
             excel_data_dTypes[fname + "_Area_N"] = pl.Utf8
@@ -292,6 +546,9 @@ def bracketResults(
             excel_data_dTypes[fname + "_FID"] = pl.Utf8
             excel_data_dTypes[fname + "_GroupID"] = pl.Utf8
             excel_data_dTypes[fname + "_isotopologRatios"] = pl.Utf8
+            excel_data_dTypes[fname + "_isoArea"] = pl.Utf8
+            excel_data_dTypes[fname + "_isoEnrichment"] = pl.Utf8
+            excel_data_dTypes[fname + "_isoCount"] = pl.Utf8
 
         excel_data["doublePeak"] = []
         excel_data_dTypes["doublePeak"] = pl.Int64
@@ -483,6 +740,9 @@ def bracketResults(
                                             peaksRatio=float(row["peaksRatio"]),
                                             peaksCorr=float(row["peaksCorr"]),
                                             isotopologRatios=pickle_loads(base64.b64decode(row["isotopologRatios"])) if row.get("isotopologRatios") else {},
+                                            isoAreas=pickle_loads(base64.b64decode(row["isoAreas"])) if row.get("isoAreas") else {},
+                                            isoEnrichment=pickle_loads(base64.b64decode(row["isoEnrichment"])) if row.get("isoEnrichment") else {},
+                                            isoCount=row.get("isoCount") or 0,
                                         )
 
                                         assert cp.ionMode in ionModes.keys()
@@ -850,22 +1110,12 @@ def bracketResults(
                                                     avgLPeakScale = sum(groupedChromPeaksAVGLPeakScale[i]) / len(groupedChromPeaksAVGLPeakScale[i])
 
                                                     # Append data to excel_data dictionary
-                                                    excel_data["Num"].append(curNum)
+                                                    excel_data["Num"].append(f"Fp.{curNum}")
                                                     excel_data["OGroup"].append(None)
                                                     excel_data["Relative_peakarea_in_group"].append(None)
                                                     excel_data["Average_peakarea"].append(None)
                                                     excel_data["Identity"].append(None)
                                                     excel_data["Comment"].append("")
-                                                    excel_data["MZ"].append(avgmz)
-                                                    excel_data["L_MZ"].append(avglmz)
-                                                    excel_data["D_MZ"].append(avgtmz)
-                                                    excel_data["MZ_Range"].append(
-                                                        "%.6f - %.6f"
-                                                        % (
-                                                            min(groupedChromPeaksAVGMz[i]),
-                                                            max(groupedChromPeaksAVGMz[i]),
-                                                        )
-                                                    )
                                                     excel_data["RT"].append(avgtime / 60.0)
                                                     excel_data["RT_Range"].append(
                                                         "%.3f - %.3f"
@@ -881,11 +1131,21 @@ def bracketResults(
                                                             avgLPeakScale,
                                                         )
                                                     )
-                                                    excel_data["Xn"].append(str(xCount))
-                                                    excel_data["Charge"].append(cLoading)
                                                     excel_data["ScanEvent"].append(scanEvent)
                                                     excel_data["Ionisation_Mode"].append(ionMode)
                                                     excel_data["Tracer"].append(str(tracer))
+                                                    excel_data["MZ"].append(avgmz)
+                                                    excel_data["L_MZ"].append(avglmz)
+                                                    excel_data["D_MZ"].append(avgtmz)
+                                                    excel_data["MZ_Range"].append(
+                                                        "%.6f - %.6f"
+                                                        % (
+                                                            min(groupedChromPeaksAVGMz[i]),
+                                                            max(groupedChromPeaksAVGMz[i]),
+                                                        )
+                                                    )
+                                                    excel_data["Xn"].append(str(xCount))
+                                                    excel_data["Charge"].append(cLoading)
 
                                                     excel_data["Ion"].append(None)
                                                     excel_data["Loss"].append(None)
@@ -936,6 +1196,9 @@ def bracketResults(
                                                             excel_data[fname + "_FID"].append(";".join([str(peak[1].id) for peak in groupedChromPeaks[i][res]]))
                                                             excel_data[fname + "_GroupID"].append(";".join([str(peak[1].fGroupID) for peak in groupedChromPeaks[i][res]]))
                                                             excel_data[fname + "_isotopologRatios"].append(";".join([json.dumps(getattr(peak[1], "isotopologRatios", {})) for peak in groupedChromPeaks[i][res]]))
+                                                            excel_data[fname + "_isoArea"].append(";".join([json.dumps(getattr(peak[1], "isoAreas", {})) for peak in groupedChromPeaks[i][res]]))
+                                                            excel_data[fname + "_isoEnrichment"].append(";".join([json.dumps(getattr(peak[1], "isoEnrichment", {})) for peak in groupedChromPeaks[i][res]]))
+                                                            excel_data[fname + "_isoCount"].append(";".join([str(getattr(peak[1], "isoCount", 0)) for peak in groupedChromPeaks[i][res]]))
 
                                                         else:
                                                             excel_data[fname + "_Found"].append(None)
@@ -965,6 +1228,9 @@ def bracketResults(
                                                             excel_data[fname + "_FID"].append(None)
                                                             excel_data[fname + "_GroupID"].append(None)
                                                             excel_data[fname + "_isotopologRatios"].append(None)
+                                                            excel_data[fname + "_isoArea"].append(None)
+                                                            excel_data[fname + "_isoEnrichment"].append(None)
+                                                            excel_data[fname + "_isoCount"].append(None)
 
                                                     excel_data["N_found_Samples"].append(nFoundSamples)
 
@@ -1084,6 +1350,21 @@ def bracketResults(
 
         excel_file = file.replace(".tsv", ".xlsx")
         plDB = PolarsDB(excel_file, format="xlsx")
+        plDB.insert_table("help", generate_help_sheet())
+
+        # Collect all file paths for sample stats
+        all_files = []
+        for key in natSort(indGroups.keys()):
+            for ident in indGroups[key]:
+                all_files.append(ident)
+        sample_stats_rows = compute_sample_stats(all_files, positiveScanEvent, negativeScanEvent)
+        if sample_stats_rows:
+            # Build a uniform schema across all rows
+            all_keys = list(sample_stats_rows[0].keys())
+            stats_dict = {k: [row.get(k) for row in sample_stats_rows] for k in all_keys}
+            sample_stats_df = pl.DataFrame(stats_dict)
+            plDB.insert_table("0_sampleStats", sample_stats_df)
+
         plDB.insert_table("Parameters", params_df)
         plDB.insert_table("1_Bracketed", df)
         plDB.commit()
@@ -1159,6 +1440,8 @@ def calculateMetaboliteGroups(
     minConnectionsInFiles=1,
     minConnectionRate=0.4,
     minPeakCorrelation=0.85,
+    useAbundanceSimilarity=True,
+    abundanceSimilarityThreshold=None,
     useRatio=False,
     runIdentificationInstance=None,
     pwMaxSet=None,
@@ -1448,6 +1731,28 @@ def calculateMetaboliteGroups(
 
             done = done + 1
 
+        if useAbundanceSimilarity:
+            logging.info("Refining feature groups by abundance profile similarity")
+            # use per-file native peak abundances to compare feature profile similarity across samples
+            abundance_cols = [col for col in table_df.columns if col.endswith("_Abundance_N")]
+            abundance_vectors = {}
+            if len(abundance_cols) > 0:
+                for row in table_df.select(["Num"] + abundance_cols).iter_rows(named=True):
+                    abundance_vectors[row["Num"]] = [row.get(col) for col in abundance_cols]
+
+            effective_abundance_threshold = minPeakCorrelation if abundanceSimilarityThreshold is None else abundanceSimilarityThreshold
+            refined_groups = []
+            for tGroup in groups:
+                refined_groups.extend(
+                    split_group_by_relative_abundance(
+                        tGroup,
+                        abundance_vectors,
+                        min_peak_correlation=effective_abundance_threshold,
+                        min_connection_rate=minConnectionRate,
+                    )
+                )
+            groups = refined_groups
+
         # Separate feature pair clusters; softer
         curGroup = 1
         for tGroup in groups:
@@ -1524,6 +1829,14 @@ def calculateMetaboliteGroups(
         resDB.conn.insert_row("Parameters", {"Parameter": "MEConvoluting_minConnectionsInFiles", "Value": f"{minConnectionsInFiles}"})
         resDB.conn.insert_row("Parameters", {"Parameter": "MEConvoluting_minConnectionRate", "Value": f"{minConnectionRate}"})
         resDB.conn.insert_row("Parameters", {"Parameter": "MEConvoluting_minPeakCorrelation", "Value": f"{minPeakCorrelation}"})
+        resDB.conn.insert_row("Parameters", {"Parameter": "MEConvoluting_useAbundanceSimilarity", "Value": f"{useAbundanceSimilarity}"})
+        resDB.conn.insert_row(
+            "Parameters",
+            {
+                "Parameter": "MEConvoluting_abundanceSimilarityThreshold",
+                "Value": f"{minPeakCorrelation if abundanceSimilarityThreshold is None else abundanceSimilarityThreshold}",
+            },
+        )
         resDB.conn.set_table(new_sheet_name, table_df)
         if double_peaks_df is not None and len(double_peaks_df) > 0:
             resDB.conn.insert_table(new_sheet_name + "_doublePeaks", double_peaks_df)

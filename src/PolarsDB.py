@@ -19,6 +19,7 @@ from __future__ import absolute_import, division, print_function
 import io
 import logging
 import os
+import shutil
 import zipfile
 from json import dumps, loads
 import polars as pl
@@ -235,6 +236,10 @@ class PolarsDB:
         """Check if a table exists."""
         return table_name in self.tables
 
+    def remove_table(self, table_name):
+        """Remove a table entirely so it is no longer written out on the next commit()/close()."""
+        self.tables.pop(table_name, None)
+
     def delete_rows(self, table_name, condition):
         """Delete rows from a table based on a condition (Polars expression)."""
         if not self.has_table(table_name):
@@ -267,12 +272,23 @@ class PolarsDB:
         if not self.tables:
             return
 
+        # copy self.filepath to a temporary file to avoid overwriting in case of errors
+        bkp_filepath = self.filepath + ".bkp"
+        if os.path.exists(bkp_filepath):
+            os.remove(bkp_filepath)
+            shutil.copyfile(self.filepath, bkp_filepath)
+
+        # save tables
         if self.format == "parquet":
             self._save_parquet_tables()
         elif self.format == "xlsx":
             self._save_xlsx_tables()
         elif self.format == "tsv":
             self._save_tsv_tables()
+
+        # remove backup
+        if os.path.exists(bkp_filepath):
+            os.remove(bkp_filepath)
 
     def _save_parquet_tables(self):
         """Save all tables as Parquet files in a ZIP archive."""
@@ -291,10 +307,38 @@ class PolarsDB:
                 if table_name != "__dTypes__":
                     # save dTypes of each row
                     dTypes_table[table_name] = df.schema
+                    df = self._dedupe_columns_case_insensitive(df, table_name)
                     df.write_excel(workbook=wb, worksheet=table_name, autofit=True, float_precision=4)
             # save dTypes table as json object
             dTypes_df = pl.DataFrame([{"table_name": tname, "schema": self.__convert_polarsSchema_to_json(schema)} for tname, schema in dTypes_table.items()])
             dTypes_df.write_excel(workbook=wb, worksheet="__dTypes__")
+
+    @staticmethod
+    def _dedupe_columns_case_insensitive(df, table_name=""):
+        """Rename columns so no two column names are equal case-insensitively.
+
+        xlsxwriter's Excel table headers must be unique case-insensitively; a collision
+        (e.g. "Collision_energy" and "COLLISION_ENERGY") makes it silently skip writing the
+        whole table (only a "Duplicate header name" warning is emitted), leaving the sheet
+        empty. Colliding columns are renamed here (keeping the first occurrence unchanged)."""
+        seen_lower = set()
+        rename_map = {}
+        for col in df.columns:
+            lower = col.lower()
+            if lower not in seen_lower:
+                seen_lower.add(lower)
+                continue
+            new_name = col
+            suffix = 2
+            while new_name.lower() in seen_lower:
+                new_name = f"{col}_{suffix}"
+                suffix += 1
+            rename_map[col] = new_name
+            seen_lower.add(new_name.lower())
+        if rename_map:
+            logging.warning(f"Sheet '{table_name}': renamed column(s) with case-insensitively duplicate names to avoid an empty Excel table: {rename_map}")
+            df = df.rename(rename_map)
+        return df
 
     def _save_tsv_tables(self):
         """Save all tables as TSV files in a ZIP archive."""

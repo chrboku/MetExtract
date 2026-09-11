@@ -25,13 +25,13 @@ import traceback
 from . import HCA_general, Baseline, exportAsFeatureML
 from .utils import CallBackMethod, getNormRatio, getDBSuffix
 from .Chromatogram import Chromatogram
-from .formulaTools import formulaTools, getIsotopeMass
+from .formulaTools import formulaTools, getIsotopeMass, calcIsoEnrichment, isotopologLabel
 from .mePyGuis.TracerEdit import ConfiguredTracer
 from .MZHCA import HierarchicalClustering, cutTreeSized
 from .PolarsDB import PolarsDB
 from .findIsoPairs_matchPartners import matchPartners
 from .SGR import SGRGenerator
-from .chromPeakPicking.peakpickers import filter_peaks
+from .chromPeakPicking.peakpickers import BasePeakPicker, filter_peaks
 import numpy as np
 import polars as pl
 import scipy
@@ -585,6 +585,9 @@ class FindIsoPairs:
                 "isotopesRatios": pl.Utf8,
                 "mzDiffErrors": pl.Utf8,
                 "isotopologRatios": pl.Utf8,
+                "isoAreas": pl.Utf8,
+                "isoEnrichment": pl.Utf8,
+                "isoCount": pl.Int64,
                 "peakType": pl.Utf8,
                 "assignedName": pl.Utf8,
                 "correlationsToOthers": pl.Utf8,
@@ -642,6 +645,9 @@ class FindIsoPairs:
                 "isotopesRatios": pl.Utf8,
                 "mzDiffErrors": pl.Utf8,
                 "isotopologRatios": pl.Utf8,
+                "isoAreas": pl.Utf8,
+                "isoEnrichment": pl.Utf8,
+                "isoCount": pl.Int64,
                 "peakType": pl.Utf8,
                 "assignedName": pl.Utf8,
                 "comment": pl.Utf8,
@@ -1167,6 +1173,22 @@ class FindIsoPairs:
                         if self.peak_filter_config is not None:
                             peaksN = filter_peaks(peaksN, config=self.peak_filter_config)
                             peaksL = filter_peaks(peaksL, config=self.peak_filter_config)
+
+                        # Recalculate SNR, FWHM, area from raw (unsmoothed) EICs
+                        # Peak boundaries are kept from smoothed-EIC detection, only metrics are recomputed
+                        times_arr = np.asarray(times)
+                        eic_raw_arr = np.asarray(eic)
+                        eicL_raw_arr = np.asarray(eicL)
+                        for pk in peaksN:
+                            pk.snr = BasePeakPicker.compute_snr(eic_raw_arr, pk.apex_index, pk.start_index, pk.end_index)
+                            pk.fwhm = BasePeakPicker.compute_fwhm(times_arr, eic_raw_arr, pk.apex_index, pk.start_index, pk.end_index)
+                            pk.area = BasePeakPicker.compute_area(times_arr, eic_raw_arr, pk.start_index, pk.end_index)
+                            pk.apex_intensity = float(eic_raw_arr[pk.apex_index])
+                        for pk in peaksL:
+                            pk.snr = BasePeakPicker.compute_snr(eicL_raw_arr, pk.apex_index, pk.start_index, pk.end_index)
+                            pk.fwhm = BasePeakPicker.compute_fwhm(times_arr, eicL_raw_arr, pk.apex_index, pk.start_index, pk.end_index)
+                            pk.area = BasePeakPicker.compute_area(times_arr, eicL_raw_arr, pk.start_index, pk.end_index)
+                            pk.apex_intensity = float(eicL_raw_arr[pk.apex_index])
 
                         # get EICs of M+1, M'-1 and M'+1 for the database
                         eicfirstiso, timesL, scanIdsL, mzsfirstiso = mzxml.getEIC(
@@ -1747,7 +1769,7 @@ class FindIsoPairs:
             lb = max(lb, 0)
             if lb >= rb:
                 return 0.0
-            return float(np.trapz(eic[lb : rb + 1], times[lb : rb + 1]))
+            return float(np.trapezoid(eic[lb : rb + 1], times[lb : rb + 1]))
 
         mass_diffs = self._get_isotopolog_mass_diffs_from_formula_tools()
         m_isotopolog_offsets = [
@@ -1826,6 +1848,116 @@ class FindIsoPairs:
         db_con.commit()
         db_con.close()
 
+    def calculateIsotopologEnrichmentForFeaturePairs(self, chromPeaks, mzxml, reportFunction=None):
+        """For each detected feature pair, quantify the individual isotopologs from M-2 to M'+2
+        (named "M+x / M'-(Xn-x)", with x the number of labelling atoms), determine how many of
+        them are present (area >= 1% of the less abundant of M/M'), and calculate the isotopic
+        enrichment from the native (M and the highest detected M+x) and labelled (M' and M'-1)
+        isotopolog pairs.
+
+        Results are stored on the peak as isoAreas (dict of "M+x / M'-(Xn-x)" -> area),
+        isoEnrichment (dict with keys "M" and "M'") and isoCount (number of isotopologs detected
+        between M and M').
+        """
+        db_con = PolarsDB(self.file + getDBSuffix(), format=getDBFormat())
+
+        def _peak_area(eic, times, lb, rb):
+            rb = min(rb, len(eic) - 1)
+            lb = max(lb, 0)
+            if lb >= rb:
+                return 0.0
+            return float(np.trapezoid(eic[lb : rb + 1], times[lb : rb + 1]))
+
+        for i, peak in enumerate(chromPeaks):
+            if reportFunction is not None:
+                reportFunction(1.0 * i / len(chromPeaks), "%d features remaining" % (len(chromPeaks) - i))
+
+            peak.isoAreas = {}
+            peak.isoEnrichment = {}
+            peak.isoCount = 0
+
+            try:
+                xCount = int(peak.xCount)
+            except (TypeError, ValueError):
+                continue
+            if xCount < 1:
+                continue
+
+            scanEvent = self.positiveScanEvent if peak.ionMode == "+" else self.negativeScanEvent
+            loading = peak.loading
+
+            # common integration border spanning both the M and M' peak boundaries
+            lb = max(0, min(peak.NPeakCenter - int(peak.NBorderLeft), peak.LPeakCenter - int(peak.LBorderLeft)))
+            rb = max(peak.NPeakCenter + int(peak.NBorderRight), peak.LPeakCenter + int(peak.LBorderRight))
+
+            eic_M, times_M, _, _ = mzxml.getEIC(peak.mz, self.chromPeakPPM, filterLine=scanEvent)
+            eic_Mp, times_Mp, _, _ = mzxml.getEIC(peak.lmz, self.chromPeakPPM, filterLine=scanEvent)
+            eic_M = np.asarray(eic_M, dtype=np.float64)
+            eic_Mp = np.asarray(eic_Mp, dtype=np.float64)
+            times_M = np.asarray(times_M, dtype=np.float64)
+            times_Mp = np.asarray(times_Mp, dtype=np.float64)
+
+            area_M = _peak_area(eic_M, times_M, lb, rb)
+            area_Mp = _peak_area(eic_Mp, times_Mp, lb, rb)
+
+            if area_M <= 0 and area_Mp <= 0:
+                continue
+
+            refArea = min(area_M, area_Mp) if area_M > 0 and area_Mp > 0 else max(area_M, area_Mp)
+            threshold = 0.01 * refArea
+
+            areasByX = {}
+            for x in range(-2, xCount + 3):
+                if x == 0:
+                    areasByX[x] = area_M
+                elif x == xCount:
+                    areasByX[x] = area_Mp
+                else:
+                    target_mz = peak.mz + x * self.xOffset / loading
+                    eic_x, times_x, _, _ = mzxml.getEIC(target_mz, self.chromPeakPPM, filterLine=scanEvent)
+                    eic_x = np.asarray(eic_x, dtype=np.float64)
+                    times_x = np.asarray(times_x, dtype=np.float64)
+                    areasByX[x] = _peak_area(eic_x, times_x, lb, rb)
+
+            isoAreas = {isotopologLabel(x, xCount): a for x, a in areasByX.items() if a >= threshold}
+            peak.isoCount = sum(1 for x in range(1, xCount) if areasByX.get(x, 0.0) >= threshold)
+            peak.isoAreas = isoAreas
+
+            # native-side enrichment: use M and the highest contiguously-detected M+x
+            nativeX = 0
+            for x in range(1, xCount):
+                if areasByX.get(x, 0.0) >= threshold:
+                    nativeX = x
+                else:
+                    break
+
+            isoEnrichment = {}
+            if nativeX >= 1 and area_M > 0:
+                isoEnrichment["M"] = calcIsoEnrichment(xCount, nativeX, areasByX[nativeX] / area_M)
+
+            # labelled-side enrichment: use M' and M'-1 (M itself if xCount == 1)
+            areaMpMinus1 = areasByX.get(xCount - 1, area_M) if xCount >= 2 else area_M
+            if area_Mp > 0 and areaMpMinus1 > 0:
+                isoEnrichment["M'"] = calcIsoEnrichment(xCount, 1, areaMpMinus1 / area_Mp)
+
+            peak.isoEnrichment = isoEnrichment
+
+        # Persist to DB
+        for peak in chromPeaks:
+            encodedAreas = base64.b64encode(dumps(getattr(peak, "isoAreas", {}))).decode("utf-8")
+            encodedEnrichment = base64.b64encode(dumps(getattr(peak, "isoEnrichment", {}))).decode("utf-8")
+            isoCount = getattr(peak, "isoCount", 0)
+            for table in ("chromPeaks", "allChromPeaks"):
+                db_con.tables[table] = db_con.tables[table].with_columns(
+                    pl.when(pl.col("id") == peak.id).then(pl.lit(encodedAreas)).otherwise(pl.col("isoAreas")).alias("isoAreas"),
+                    pl.when(pl.col("id") == peak.id).then(pl.lit(encodedEnrichment)).otherwise(pl.col("isoEnrichment")).alias("isoEnrichment"),
+                    pl.when(pl.col("id") == peak.id).then(pl.lit(isoCount)).otherwise(pl.col("isoCount")).alias("isoCount"),
+                )
+
+        self.printMessage("Isotopolog enrichment calculation done.", type="info")
+        db_con.commit()
+        db_con.close()
+
     # data processing step 5: in full metabolome labeling experiments hetero atoms (e.g. S, Cl) may
     # show characterisitc isotope patterns on the labeled metabolite ion side. There, these peaks may not be
     # dominated by the usually much more abundant carbon isotopes and can thus be easier seen. However, for
@@ -1846,6 +1978,12 @@ class FindIsoPairs:
             peak = chromPeaks[i]
 
             ## Annotate hetero atoms
+            scanEvent = ""
+            if peak.ionMode == "+":
+                scanEvent = self.positiveScanEvent
+            elif peak.ionMode == "-":
+                scanEvent = self.negativeScanEvent
+
             for pIso in self.heteroAtoms:
                 pIsotope = self.heteroAtoms[pIso]
 
@@ -1860,12 +1998,6 @@ class FindIsoPairs:
                     refMz = peak.mz
                 else:
                     refMz = peak.lmz
-
-                scanEvent = ""
-                if peak.ionMode == "+":
-                    scanEvent = self.positiveScanEvent
-                elif peak.ionMode == "-":
-                    scanEvent = self.negativeScanEvent
 
                 for haCount in range(pIsotope.minCount, pIsotope.maxCount + 1):
                     if haCount == 0:
@@ -2683,6 +2815,11 @@ class FindIsoPairs:
                 allPeaks[peak.id] = peak
                 peak.correlationsToOthers = []
 
+            # sort by NPeakCenter once so the inner loop can break early on RT distance
+            chromPeaks = sorted(chromPeaks, key=lambda p: p.NPeakCenter)
+
+            ff_rows = []  # accumulated featurefeatures rows for a single bulk insert
+
             # compare all detected feature pairs at approximately the same retention time
             for piA in range(len(chromPeaks)):
                 peakA = chromPeaks[piA]
@@ -2695,12 +2832,19 @@ class FindIsoPairs:
                 if peakA.id not in correlations.keys():
                     correlations[peakA.id] = {}
 
-                for peakB in chromPeaks:
+                for piB in range(piA + 1, len(chromPeaks)):
+                    peakB = chromPeaks[piB]
+
+                    # peaks are sorted by NPeakCenter; once the RT gap exceeds the threshold
+                    # all remaining peaks are even further away — safe to stop early
+                    if peakB.NPeakCenter - peakA.NPeakCenter >= self.peakCenterError:
+                        break
+
                     if peakB.id not in correlations.keys():
                         correlations[peakB.id] = {}
 
                     if peakA.mz < peakB.mz:
-                        if abs(peakA.NPeakCenter - peakB.NPeakCenter) < self.peakCenterError:
+                        if True:  # RT check already handled by the sorted early-exit above
                             bmin = int(
                                 max(
                                     0,
@@ -2767,10 +2911,16 @@ class FindIsoPairs:
                                 logging.error("Error while convoluting two feature pairs, skipping.. (%s)" % str(e))
 
                             try:
-                                db_con.insert_row("featurefeatures", {"fID1": peakA.id, "fID2": peakB.id, "corr": pb, "silRatioValue": silRatiosFold})
+                                ff_rows.append({"fID1": peakA.id, "fID2": peakB.id, "corr": pb, "silRatioValue": silRatiosFold})
                             except Exception as e:
                                 logging.error("Error while convoluting two feature pairs, skipping.. (%s)" % str(e))
-                                db_con.insert_row("featurefeatures", {"fID1": peakA.id, "fID2": peakB.id, "corr": 0, "silRatioValue": 0})
+                                ff_rows.append({"fID1": peakA.id, "fID2": peakB.id, "corr": 0, "silRatioValue": 0})
+
+            # bulk-insert all featurefeatures rows at once instead of one per pair
+            if ff_rows:
+                _ff_schema = db_con.tables["featurefeatures"].schema
+                _ff_new = pl.DataFrame(ff_rows, schema=_ff_schema)
+                db_con.tables["featurefeatures"] = pl.concat([db_con.tables["featurefeatures"], _ff_new], how="vertical")
 
             self.postMessageToProgressWrapper("text", "%s: Convoluting feature groups" % tracer.name)
 
@@ -2780,11 +2930,7 @@ class FindIsoPairs:
                 delattr(peak, "times")
 
             for k in nodes.keys():
-                uniq = []
-                for u in nodes[k]:
-                    if u not in uniq:
-                        uniq.append(u)
-                nodes[k] = uniq
+                nodes[k] = list(set(nodes[k]))
 
             # get subgraphs from the feature pair graph. Each subgraph represents one convoluted
             # feature group
@@ -2858,8 +3004,8 @@ class FindIsoPairs:
                     # print("HCA with", len(cGroups))
                     gGroup = cGroups.pop(0)
 
-                    ## TODO optimize this code, it recalculates the computationally expensive HCA too often for a high number of features
-                    if False and len(gGroup) > 100:
+                    ## skip expensive HCA splitting for very large groups — keep them as-is
+                    if len(gGroup) > 100:
                         groups.append(gGroup)
                         continue
 
@@ -2909,24 +3055,57 @@ class FindIsoPairs:
                         "%s: Annotating feature groups (%d/%d done)" % (tracer.name, done, len(groups)),
                     )
 
+            # collect all per-peak update data and apply in a single batch join-based update
+            _update_ids = []
+            _update_adducts = []
+            _update_fDesc = []
+            _update_corrToOthers = []
+            _update_heteroAtoms = []
+
             for peak in chromPeaks:
                 adds = countEntries(peak.adducts)
                 peak.adducts = list(adds.keys())
 
-                # Update chromPeaks
-                db_con.tables["chromPeaks"] = db_con.tables["chromPeaks"].with_columns(
-                    pl.when(pl.col("id") == peak.id).then(pl.lit(base64.b64encode(dumps(peak.adducts)).decode("utf-8"))).otherwise(pl.col("adducts")).alias("adducts"),
-                    pl.when(pl.col("id") == peak.id).then(pl.lit(base64.b64encode(dumps(peak.fDesc)).decode("utf-8"))).otherwise(pl.col("fDesc")).alias("fDesc"),
-                    pl.when(pl.col("id") == peak.id).then(pl.lit(base64.b64encode(dumps(peak.correlationsToOthers)).decode("utf-8"))).otherwise(pl.col("correlationsToOthers")).alias("correlationsToOthers"),
-                    pl.when(pl.col("id") == peak.id).then(pl.lit(base64.b64encode(dumps(peak.heteroAtomsFeaturePairs)).decode("utf-8"))).otherwise(pl.col("heteroAtomsFeaturePairs")).alias("heteroAtomsFeaturePairs"),
-                )
+                _update_ids.append(peak.id)
+                _update_adducts.append(base64.b64encode(dumps(peak.adducts)).decode("utf-8"))
+                _update_fDesc.append(base64.b64encode(dumps(peak.fDesc)).decode("utf-8"))
+                _update_corrToOthers.append(base64.b64encode(dumps(peak.correlationsToOthers)).decode("utf-8"))
+                _update_heteroAtoms.append(base64.b64encode(dumps(peak.heteroAtomsFeaturePairs)).decode("utf-8"))
 
-                # Update allChromPeaks
-                db_con.tables["allChromPeaks"] = db_con.tables["allChromPeaks"].with_columns(
-                    pl.when(pl.col("id") == peak.id).then(pl.lit(base64.b64encode(dumps(peak.adducts)).decode("utf-8"))).otherwise(pl.col("adducts")).alias("adducts"),
-                    pl.when(pl.col("id") == peak.id).then(pl.lit(base64.b64encode(dumps(peak.fDesc)).decode("utf-8"))).otherwise(pl.col("fDesc")).alias("fDesc"),
-                    pl.when(pl.col("id") == peak.id).then(pl.lit(base64.b64encode(dumps(peak.heteroAtomsFeaturePairs)).decode("utf-8"))).otherwise(pl.col("heteroAtomsFeaturePairs")).alias("heteroAtomsFeaturePairs"),
+            _upd_df = pl.DataFrame(
+                {
+                    "id": _update_ids,
+                    "_adducts": _update_adducts,
+                    "_fDesc": _update_fDesc,
+                    "_corrToOthers": _update_corrToOthers,
+                    "_heteroAtoms": _update_heteroAtoms,
+                }
+            )
+
+            # single join-based update for chromPeaks
+            db_con.tables["chromPeaks"] = (
+                db_con.tables["chromPeaks"]
+                .join(_upd_df, on="id", how="left")
+                .with_columns(
+                    pl.coalesce([pl.col("_adducts"), pl.col("adducts")]).alias("adducts"),
+                    pl.coalesce([pl.col("_fDesc"), pl.col("fDesc")]).alias("fDesc"),
+                    pl.coalesce([pl.col("_corrToOthers"), pl.col("correlationsToOthers")]).alias("correlationsToOthers"),
+                    pl.coalesce([pl.col("_heteroAtoms"), pl.col("heteroAtomsFeaturePairs")]).alias("heteroAtomsFeaturePairs"),
                 )
+                .drop(["_adducts", "_fDesc", "_corrToOthers", "_heteroAtoms"])
+            )
+
+            # single join-based update for allChromPeaks (no correlationsToOthers column there)
+            db_con.tables["allChromPeaks"] = (
+                db_con.tables["allChromPeaks"]
+                .join(_upd_df.select(["id", "_adducts", "_fDesc", "_heteroAtoms"]), on="id", how="left")
+                .with_columns(
+                    pl.coalesce([pl.col("_adducts"), pl.col("adducts")]).alias("adducts"),
+                    pl.coalesce([pl.col("_fDesc"), pl.col("fDesc")]).alias("fDesc"),
+                    pl.coalesce([pl.col("_heteroAtoms"), pl.col("heteroAtomsFeaturePairs")]).alias("heteroAtomsFeaturePairs"),
+                )
+                .drop(["_adducts", "_fDesc", "_heteroAtoms"])
+            )
 
             # store feature group in the database
             for group in sorted(
@@ -3439,6 +3618,22 @@ class FindIsoPairs:
 
             self.printMessage(
                 "Isotopolog ratio calculation done.",
+                type="info",
+            )
+            # endregion
+
+            # region 7c. Calculate isotopolog enrichment for each feature pair
+            ######################################################################################
+
+            self.postMessageToProgressWrapper("text", "Calculating isotopolog enrichment")
+
+            def reportFunction(curVal, text):
+                self.postMessageToProgressWrapper("text", "Calculating isotopolog enrichment (%s)" % text)
+
+            self.calculateIsotopologEnrichmentForFeaturePairs(chromPeaks, mzxml, reportFunction)
+
+            self.printMessage(
+                "Isotopolog enrichment calculation done.",
                 type="info",
             )
             # endregion

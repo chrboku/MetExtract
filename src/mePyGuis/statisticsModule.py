@@ -33,6 +33,7 @@ class StatisticsData:
         self.imputation_method: str = "zero"  # "zero" or "lod_half"
         self.feature_filter: str = "all"  # "all" or "most_abundant"
         self.group_info: Dict[str, List[str]] = {}  # group_name -> [sample_names]
+        self.group_colors: Dict[str, str] = {}  # group_name -> hex color, synced with the Input tab's group colors
         self.feature_metadata: Optional[pd.DataFrame] = None
         self.selected_features: List[int] = []
         self.volcano_comparisons: List[Tuple[str, str]] = []  # (group1, group2) pairs
@@ -83,6 +84,9 @@ class StatisticsData:
                 logging.info(f"Group info loaded: {list(self.group_info.keys())}")
                 for group_name, samples in self.group_info.items():
                     logging.info(f"  Group '{group_name}': {samples[:3] if len(samples) > 3 else samples}...")
+
+            if "group_colors" in experiment_data:
+                self.group_colors = experiment_data["group_colors"]
 
             if "metadata" in experiment_data:
                 self.feature_metadata = pd.DataFrame(experiment_data["metadata"])
@@ -516,9 +520,11 @@ class UnivariateAnalysis:
                             fp_id = metadata.loc[idx, "num"] if "num" in metadata.columns else 0
                             fg_id = metadata.loc[idx, "ogroup"] if "ogroup" in metadata.columns else 0
 
-                            # Convert to int if not None/NaN
+                            # "num" is always numeric; "ogroup" is often a non-numeric compound
+                            # name/identifier, so it must be kept as-is (a plain int() cast would
+                            # raise and silently fall back to 0 for every non-numeric OGroup).
                             fp_id = int(fp_id) if pd.notna(fp_id) else 0
-                            fg_id = int(fg_id) if pd.notna(fg_id) else 0
+                            fg_id = fg_id if pd.notna(fg_id) else 0
 
                             feature_pair_ids.append(fp_id)
                             feature_group_ids.append(fg_id)
