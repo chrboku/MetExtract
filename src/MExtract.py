@@ -19176,19 +19176,19 @@ def main():
         QtWidgets.QMessageBox.information(
             None,
             "MetExtract",
-            "When you start a new experiment, please <b>change the<br>"
+            "Tip: When you start a new experiment, please <b>change the<br>"
             + "working directory</b> to your experimental folder.<br>"
             + "You can set the working directory via the menu<br>"
             + "('Tools'->'Set working directory')."
             + "<br><br>"
-            + "Please also consider <b>copying</b> any databases or<br>"
-            + "other resources to your working directory."
+            + "Tip: Please also consider <b>copying</b> any databases or<br>"
+            + "other resources to your working directory (e.g., DB folder)."
             + "<br><br>"
-            + "To quickly change the values of drop-down and<br>"
+            + "Tip: To quickly change the values of drop-down and<br>"
             + "integer/float spinner controls, <b>hold the CTRL-key<br>"
             + "and use the mouse-wheel</b>."
             + "<br><br>"
-            + "If importing mzML files results in the error<br>"
+            + "Tip: If importing mzML files results in the error<br>"
             + "of missing files, please find the correct version at<br>"
             + f"<b>{OBO_DOWNLOAD_URL}</b>.<br>"
             + "Please download the corresponding obo-file and<br>"
@@ -19201,15 +19201,23 @@ def main():
             + "using a regular expression. Leave it empty to show all<br>"
             + "spectra; a capturing group is shown in the first column.<br>"
             + "The 'Show filter strings' button lists all loaded filter<br>"
-            + "strings."
+            + "strings (e.g., '(FTMS).*' or '(FTMS|ITMS).*')."
             + "<br><br>"
-            + "To generate a template for a database, select<br>"
+            + "Tip: To generate a template for a database, select<br>"
             + "<b>'Download Database Template'</b> from the 'Tools' menu."
             + "<br><br>"
-            + "Results XLSX files can be modified. Additional columns<br>"
+            + "Tip: Results XLSX files can be modified. Additional columns<br>"
             + "(e.g., for user-based grouping) may be used as a grouping<br>"
             + "factor in the <b>Experimental results</b> (e.g., isotopic<br>"
-            + "pattern clustering, statistically sig. metabolites, etc.).",
+            + "pattern clustering, statistically sig. metabolites, etc.)."
+            + "<br><br>"
+            + "Tip: Use <b>Ctrl + 'draw a rectangle'</b> to select significantly<br>"
+            + "different features in volcano plots. These will then automatically<br>"
+            + "be selected in the feature list in the Experiment results."
+            + "<br><br>"
+            + "Tip: Save your <b>panel layout</b> using the files menu and <br>"
+            + "conveniently restore a previous layout from there as well."
+            ,
             QtWidgets.QMessageBox.Ok,
         )
 
