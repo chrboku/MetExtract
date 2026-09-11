@@ -520,9 +520,11 @@ class UnivariateAnalysis:
                             fp_id = metadata.loc[idx, "num"] if "num" in metadata.columns else 0
                             fg_id = metadata.loc[idx, "ogroup"] if "ogroup" in metadata.columns else 0
 
-                            # Convert to int if not None/NaN
+                            # "num" is always numeric; "ogroup" is often a non-numeric compound
+                            # name/identifier, so it must be kept as-is (a plain int() cast would
+                            # raise and silently fall back to 0 for every non-numeric OGroup).
                             fp_id = int(fp_id) if pd.notna(fp_id) else 0
-                            fg_id = int(fg_id) if pd.notna(fg_id) else 0
+                            fg_id = fg_id if pd.notna(fg_id) else 0
 
                             feature_pair_ids.append(fp_id)
                             feature_group_ids.append(fg_id)

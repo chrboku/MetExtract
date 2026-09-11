@@ -69,6 +69,7 @@ class AnnotationBrowserWidget(QtWidgets.QWidget):
     feature's "Num" when the user clicks a feature (leaf) row."""
 
     featureSelected = QtCore.Signal(int)
+    filterMetabolitesRequested = QtCore.Signal(list, list)  # (ogroups, nums)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -88,10 +89,52 @@ class AnnotationBrowserWidget(QtWidgets.QWidget):
         self.tree.setColumnCount(len(COLUMNS))
         self.tree.setHeaderLabels(COLUMNS)
         self.tree.itemClicked.connect(self._on_item_clicked)
+        self.tree.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._show_context_menu)
         layout.addWidget(self.tree, 1)
+
+        self._id_filter_visible_nums = None  # None = no active Experiment results ID filter
 
     def clear(self):
         self.tree.clear()
+
+    def set_id_filter(self, visible_nums):
+        """Called by MExtract whenever the Experiment results OGroup/Num ID filter changes.
+        `visible_nums` is the set of feature Nums still visible in the Experiment results tree
+        (None = no filter active). Hides feature rows not in the set, and any
+        library/compound/type row left with no visible feature underneath it."""
+        self._id_filter_visible_nums = visible_nums
+        self._apply_filter(self.filter_edit.text())
+
+    def _show_context_menu(self, position):
+        """Right-click menu for a non-feature (aggregate) row: lets the user filter the
+        Experiment results tree/volcano plots by all OGroups/Nums nested under this entry."""
+        item = self.tree.itemAt(position)
+        if item is None or item.data(0, QtCore.Qt.UserRole) is not None:
+            return  # only offered for non-leaf (aggregate) rows, not individual feature entries
+
+        ogroups = set()
+        nums = set()
+
+        def _collect(node):
+            num = node.data(0, QtCore.Qt.UserRole)
+            if num is not None:
+                nums.add(num)
+                ogroup_text = node.text(2)
+                if ogroup_text:
+                    ogroups.add(ogroup_text)
+            for c in range(node.childCount()):
+                _collect(node.child(c))
+
+        _collect(item)
+        if not ogroups and not nums:
+            return
+
+        menu = QtWidgets.QMenu(self.tree)
+        action = menu.addAction("Filter these metabolites")
+        chosen = menu.exec(self.tree.viewport().mapToGlobal(position))
+        if chosen is action:
+            self.filterMetabolitesRequested.emit(sorted(ogroups), sorted(nums))
 
     def load(self, store: AnnotationStore):
         """(Re)build the whole tree from the given `AnnotationStore`."""
@@ -107,6 +150,7 @@ class AnnotationBrowserWidget(QtWidgets.QWidget):
         self.tree.expandToDepth(0)
         for col in range(self.tree.columnCount()):
             self.tree.resizeColumnToContents(col)
+        self._apply_filter(self.filter_edit.text())
 
     # ------------------------------------------------------------------ MS/MS
     def _add_msms_branch(self, rows):
@@ -257,6 +301,7 @@ class AnnotationBrowserWidget(QtWidgets.QWidget):
 
     def _apply_filter(self, text):
         text = text.strip().lower()
+        visible_nums = self._id_filter_visible_nums
         for i in range(self.tree.topLevelItemCount()):
             type_item = self.tree.topLevelItem(i)
             type_visible = False
@@ -265,7 +310,17 @@ class AnnotationBrowserWidget(QtWidgets.QWidget):
                 library_visible = False
                 for k in range(library_item.childCount()):
                     compound_item = library_item.child(k)
-                    match = not text or text in compound_item.text(0).lower() or text in library_item.text(0).lower()
+                    text_match = not text or text in compound_item.text(0).lower() or text in library_item.text(0).lower()
+
+                    has_visible_feature = visible_nums is None
+                    for f in range(compound_item.childCount()):
+                        feature_item = compound_item.child(f)
+                        num = feature_item.data(0, QtCore.Qt.UserRole)
+                        id_match = visible_nums is None or num in visible_nums
+                        feature_item.setHidden(not id_match)
+                        has_visible_feature |= id_match
+
+                    match = text_match and has_visible_feature
                     compound_item.setHidden(not match)
                     library_visible |= match
                 library_item.setHidden(not library_visible)

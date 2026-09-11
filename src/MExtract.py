@@ -2845,7 +2845,9 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         actions = self._addFeatureCopyMenu(menu, values)
 
         comment_edit_action = None
+        set_identity_action = None
         is_feature = bd is not None and getattr(bd, "type", None) == "featurePair"
+        is_group_like = bd is not None and getattr(bd, "type", None) in ("featurePair", "metaboliteGroup") and values.get("ogroup")
         if is_feature:
             menu.addSeparator()
             current_comment = self._getFeatureComment(bd.id)
@@ -2854,7 +2856,11 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             info_action.setEnabled(False)
             comment_edit_action = menu.addAction("Edit Comment...")
 
-        if not actions and comment_edit_action is None:
+        if is_group_like:
+            menu.addSeparator()
+            set_identity_action = menu.addAction("Set identity...")
+
+        if not actions and comment_edit_action is None and set_identity_action is None:
             return
 
         chosen = menu.exec_(tree.mapToGlobal(position))
@@ -2864,6 +2870,8 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             pyperclip.copy(actions[chosen])
         elif chosen is comment_edit_action:
             self._editFeatureComment(bd.id)
+        elif chosen is set_identity_action:
+            self._editFeatureIdentity(values["ogroup"])
 
     def _getFeatureComment(self, num) -> str:
         """Return the current 'Comment' value for the feature identified by `num` (Num column)."""
@@ -2914,6 +2922,62 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         if not ok:
             return
         self._setFeatureComment(num, new_comment)
+
+    def _editFeatureIdentity(self, old_ogroup):
+        """Open a dialog to rename an OGroup value (its 'identity') and propagate the
+        rename to the results table, the Experiment results tree, the Annotation
+        browser and the Statistics/volcano plots."""
+        if not old_ogroup:
+            return
+        new_name, ok = QtWidgets.QInputDialog.getText(self, "Set identity", f"New identity for '{old_ogroup}':", QtWidgets.QLineEdit.Normal, str(old_ogroup))
+        if not ok:
+            return
+        new_name = new_name.strip()
+        if not new_name or new_name == str(old_ogroup):
+            return
+        self._setFeatureIdentity(old_ogroup, new_name)
+
+    def _setFeatureIdentity(self, old_ogroup, new_name: str):
+        """Rename every row whose 'OGroup' equals `old_ogroup` to `new_name`, persist it to
+        the results file, then refresh the tree, annotation browser and statistics tab."""
+        if not hasattr(self, "experimentResults") or self.experimentResults is None or self.experimentResults.db_con is None:
+            return
+        selected_table = getattr(self.experimentResults, "selected_table", None)
+        if selected_table is None or selected_table not in self.experimentResults.db_con.tables:
+            return
+        db_con = self.experimentResults.db_con
+        if "OGroup" not in db_con.tables[selected_table].columns:
+            return
+
+        progress = QtWidgets.QProgressDialog("MetExtract II is saving the new identity...", "", 0, 0, self)
+        progress.setWindowTitle("Saving Identity")
+        progress.setCancelButton(None)
+        progress.setWindowModality(QtCore.Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+        QtWidgets.QApplication.processEvents()
+        try:
+            db_con.update_rows(selected_table, pl.col("OGroup") == old_ogroup, {"OGroup": new_name})
+            db_con.commit()
+
+            # Refresh the "Experiment results" tree
+            group_results_df = db_con.tables[selected_table]
+            self._buildExperimentResultsTree(group_results_df, selected_table)
+
+            # Refresh the Annotation browser
+            self.experimentResults.annotation_store = AnnotationStore(db_con, main_table_name=selected_table)
+            self.ui.annotationBrowserWidget.load(self.experimentResults.annotation_store)
+
+            # Refresh the Statistics tab (PCA/HCA/heatmap/volcano plots)
+            if hasattr(self, "_loadStatisticsData"):
+                try:
+                    self._loadStatisticsData()
+                except Exception:
+                    logging.exception("Failed to refresh statistics tab after identity rename")
+        except Exception:
+            logging.exception("Failed to save new identity to results file")
+        finally:
+            progress.close()
 
     def _showFeatureInExperimentResults(self, feature_index: int):
         """Navigate to the experiment results pane and select the specified feature."""
@@ -3350,23 +3414,26 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         if done > 0:
             pi = plotItems[0]
             for oi, o in enumerate(offsetOrder):
-                self.ui.resultsExperimentSeparatedPeaks_plot.axes.axvline(x=oi * shiftMinutes + pi.rt / 60.0, color=o[1])
+                x_pos = oi * shiftMinutes + pi.rt / 60.0
+                self.ui.resultsExperimentSeparatedPeaks_plot.axes.axvline(x=x_pos, color=o[1])
                 label = o[0]
                 if separateBy == "Group":
-                    found, rsd = self._groupSampleStats(o[0], plotItems, definedGroups, rowsByNum)
-                    label = "%s\n%s\n%s" % (o[0], found, rsd)
+                    found, _rsd = self._groupSampleStats(o[0], plotItems, definedGroups, rowsByNum)
+                    label = "%s  %s" % (o[0], found.replace("found ", ""))
+                # Show the (rotated) label like an x-axis tick label, below the plot,
+                # instead of on top of it.
                 self.ui.resultsExperimentSeparatedPeaks_plot.axes.text(
-                    x=oi * shiftMinutes + pi.rt / 60.0,
-                    y=intlim[1] * 1.05,
+                    x=x_pos,
+                    y=-0.02,
                     s=label,
-                    rotation=0,
-                    horizontalalignment="center",
-                    verticalalignment="bottom",
+                    transform=self.ui.resultsExperimentSeparatedPeaks_plot.axes.get_xaxis_transform(),
+                    rotation=90,
+                    horizontalalignment="right",
+                    verticalalignment="top",
                     color=o[1],
                     backgroundcolor="white",
                     weight="bold",
                 )
-            intlim[1] = intlim[1] * 1.5
 
             self.ui.resultsExperiment_plot.axes.set_xlabel("Retention time (min)")
             self.ui.resultsExperiment_plot.axes.set_ylabel("Intensity")
@@ -4593,11 +4660,20 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
         fig.tight_layout(rect=[0, 0, 1.0, 1.0 - legend_fraction])
 
+        # Fit the figure exactly to the available viewport (instead of a fixed size per
+        # subplot that grows with rows*cols and forces scrollbars); recomputed on every
+        # render so switching feature/page never leaves the canvas larger than its pane.
+        # `canvas.resize(...)` is called explicitly (not just setMinimumSize) because Qt's
+        # layout otherwise only re-syncs the canvas's actual pixel size on the next real
+        # resize event of the pane, not immediately after new plot data is rendered.
+        viewport = self.ui.scrollArea_sample_peaks.viewport()
         dpi = self.ui.resultsExperimentSamplePeaks_plot.dpi
-        w_px = int(fig_width * dpi)
-        h_px = int(fig_height * dpi)
-        canvas.setMinimumSize(w_px, h_px)
-        self.ui.resultsExperimentSamplePeaks_widget.setMinimumSize(w_px, h_px + 40)
+        avail_w_px = max(viewport.width(), 200)
+        avail_h_px = max(viewport.height(), 150)
+        fig.set_size_inches(avail_w_px / dpi, avail_h_px / dpi)
+        canvas.setMinimumSize(0, 0)
+        self.ui.resultsExperimentSamplePeaks_widget.setMinimumSize(0, 0)
+        canvas.resize(avail_w_px, avail_h_px)
 
         canvas.draw()
 
@@ -11869,10 +11945,16 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             return
 
         if len(scans) == 2:
-            label.setText(f"<b>Selected spectra similarity ({algorithm_name}):</b> {scores[0]:.3f}")
+            text = f"<b>Selected spectra similarity ({algorithm_name})\n</b> {scores[0]:.3f}"
+            spec_a = self._to_matchms_spectrum(scans[0], rel_intensity_pct=rel_intensity_pct)
+            spec_b = self._to_matchms_spectrum(scans[1], rel_intensity_pct=rel_intensity_pct)
+            if spec_a is not None and spec_b is not None:
+                stats = self._msms_pair_match_stats(spec_a, spec_b, mz_tolerance)
+                text += f" | matched fragments: {stats['n_matched']} | unique to A: {stats['n_unique_a']} ({stats['pct_int_unique_a']:.1f}% intensity) | unique to B: {stats['n_unique_b']} ({stats['pct_int_unique_b']:.1f}% intensity)"
+            label.setText(text)
         else:
             arr = np.asarray(scores, dtype=float)
-            label.setText(f"<b>Selected spectra similarity ({algorithm_name}), n={len(scans)}:</b> min={arr.min():.3f}, mean={arr.mean():.3f}, max={arr.max():.3f} (pairs={len(scores)})")
+            label.setText(f"<b>Selected spectra similarity ({algorithm_name})\nn={len(scans)}:</b> min={arr.min():.3f}, mean={arr.mean():.3f}, max={arr.max():.3f} (pairs={len(scores)})")
 
     def updatePeakDetailsTab(self, plotItems):
         """Populate the peak details tab tables for the selected features."""
@@ -12259,6 +12341,10 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.ui.plMSMS_exp.axes = []
 
         n_spectra = len(selected_rows)
+        if n_spectra == 2:
+            self._plot_msms_mirror_exp(selected_rows)
+            return
+
         n_cols = 1 if n_spectra == 2 else min(2, n_spectra)
         n_rows = (n_spectra + n_cols - 1) // n_cols
 
@@ -12310,6 +12396,67 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             self.ui.plMSMS_exp.fig.tight_layout()
         except Exception:
             self.ui.plMSMS_exp.fig.subplots_adjust(left=0.08, bottom=0.08, right=0.98, top=0.95, hspace=0.4, wspace=0.3)
+
+        self._setup_msms_hover(self.ui.plMSMS_exp)
+        self.ui.plMSMS_exp.canvas.draw()
+
+    def _plot_msms_mirror_exp(self, selected_rows):
+        """Render exactly 2 selected MS/MS spectra as a single mirror plot (spectrum A
+        above the x-axis, spectrum B below), instead of two stacked subplots."""
+        scans = []
+        colors = []
+        for row_idx in selected_rows:
+            col0 = self.ui.msms_SpectraList_exp.item(row_idx, 0)
+            if col0 is None:
+                continue
+            scan = col0.data(QtCore.Qt.UserRole)
+            form_type = col0.data(QtCore.Qt.UserRole + 1)
+            color = "firebrick" if form_type == "labeled" else "dodgerblue"
+            scans.append(scan)
+            colors.append(color)
+
+        if len(scans) != 2:
+            self.ui.plMSMS_exp.canvas.draw()
+            return
+
+        scan_a, scan_b = scans
+        color_a, color_b = colors
+
+        ax = self.ui.plMSMS_exp.fig.add_subplot(1, 1, 1)
+        self.ui.plMSMS_exp.axes = [ax]
+
+        def _plot_side(scan, color, sign, label_va):
+            if scan is None or len(scan.mz_list) == 0:
+                return [], [], color
+            mz = scan.mz_list
+            intens = [sign * v for v in scan.intensity_list]
+            ax.vlines(mz, 0, intens, colors=color, linewidth=1.5)
+            ax.plot(mz, intens, "o", markersize=3, color=color)
+            intensity_with_idx = sorted(((v, i) for i, v in enumerate(scan.intensity_list)), reverse=True)
+            for _, peak_idx in intensity_with_idx[:10]:
+                mz_val = scan.mz_list[peak_idx]
+                intensity_val = intens[peak_idx]
+                ax.text(mz_val, intensity_val * 1.01, "%.4f" % mz_val, fontsize=9, ha="center", va=label_va, rotation=0, color=color, alpha=0.6)
+            return list(mz), intens, color
+
+        mz_a, int_a, _ = _plot_side(scan_a, color_a, 1, "bottom")
+        mz_b, int_b, _ = _plot_side(scan_b, color_b, -1, "top")
+        # Combine both spectra's peaks into a single per-axis dataset for hover picking
+        ax._msms_peaks = (mz_a + mz_b, int_a + int_b, color_a)
+
+        ax.axhline(0, color="black", linewidth=0.8)
+        ax.set_xlabel("m/z", fontsize=12)
+        ax.set_ylabel("Intensity (A up / B down)", fontsize=12)
+        title_a = "Scan %d: %.4f m/z | RT %.2f min" % (scan_a.id, scan_a.precursor_mz, scan_a.retention_time / 60.0) if scan_a else "A: n/a"
+        title_b = "Scan %d: %.4f m/z | RT %.2f min" % (scan_b.id, scan_b.precursor_mz, scan_b.retention_time / 60.0) if scan_b else "B: n/a"
+        ax.set_title(f"A ({title_a})  vs  B ({title_b})", fontsize=10)
+        ax.tick_params(labelsize=12)
+        ax.grid(True, alpha=0.3)
+
+        try:
+            self.ui.plMSMS_exp.fig.tight_layout()
+        except Exception:
+            self.ui.plMSMS_exp.fig.subplots_adjust(left=0.08, bottom=0.08, right=0.98, top=0.95)
 
         self._setup_msms_hover(self.ui.plMSMS_exp)
         self.ui.plMSMS_exp.canvas.draw()
@@ -12430,6 +12577,44 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         restricted_a = MatchmsSpectrum(mz=mz_a[keep_a], intensities=int_a[keep_a], metadata=spec_a.metadata)
         restricted_b = MatchmsSpectrum(mz=mz_b[keep_b], intensities=int_b[keep_b], metadata=spec_b.metadata)
         return restricted_a, restricted_b
+
+    @staticmethod
+    def _msms_pair_match_stats(spec_a, spec_b, mz_tolerance):
+        """For two matchms spectra, return a dict with:
+        n_matched: number of fragments in A that have a matching counterpart in B
+        n_unique_a / n_unique_b: number of fragments unique to A / B
+        pct_int_unique_a / pct_int_unique_b: percentage of A's / B's total (normalized)
+          intensity contributed by fragments unique to that spectrum
+        """
+        mz_a = spec_a.peaks.mz
+        int_a = spec_a.peaks.intensities
+        mz_b = spec_b.peaks.mz
+        int_b = spec_b.peaks.intensities
+        matched_a = np.zeros(len(mz_a), dtype=bool)
+        matched_b = np.zeros(len(mz_b), dtype=bool)
+        for i, mz in enumerate(mz_a):
+            diffs = np.abs(mz_b - mz)
+            matches = np.where(diffs <= mz_tolerance)[0]
+            if matches.size > 0:
+                matched_a[i] = True
+                matched_b[matches] = True
+
+        n_matched = int(matched_a.sum())
+        n_unique_a = int((~matched_a).sum())
+        n_unique_b = int((~matched_b).sum())
+
+        total_a = float(int_a.sum())
+        total_b = float(int_b.sum())
+        pct_int_unique_a = float(int_a[~matched_a].sum() / total_a * 100.0) if total_a > 0 else 0.0
+        pct_int_unique_b = float(int_b[~matched_b].sum() / total_b * 100.0) if total_b > 0 else 0.0
+
+        return {
+            "n_matched": n_matched,
+            "n_unique_a": n_unique_a,
+            "n_unique_b": n_unique_b,
+            "pct_int_unique_a": pct_int_unique_a,
+            "pct_int_unique_b": pct_int_unique_b,
+        }
 
     def _msms_pair_score_and_matches(self, algorithm, spec_a, spec_b, ignore_unmatched=False, mz_tolerance=0.01):
         """Return (score, n_matches, n_fragments_a, n_fragments_b) for a pair of matchms
@@ -15083,7 +15268,8 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.ui.expFilterContent.setVisible(checked)
         self.ui.expFilterToggleBtn.setText("Hide filters \u25b4" if checked else "Show filters \u25be")
         if not checked:
-            # Clear all filter fields when collapsing
+            # Clear all filter fields when collapsing (ID filter fields are left untouched
+            # since they can be set independently, e.g. from the volcano plot or annotation browser)
             self.ui.expFilter_mz.clear()
             self.ui.expFilter_rt.clear()
             self.ui.expFilter_xn.clear()
@@ -15104,6 +15290,27 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         # Show filter panel when resetting
         if not self.ui.expFilterToggleBtn.isChecked():
             self.ui.expFilterToggleBtn.setChecked(True)
+
+    def _onExpResetIDFilter(self):
+        """Clear the OGroups/Num ID filter fields and hide the 'Reset ID filter' button."""
+        self.ui.expFilter_ogroups.clear()
+        self.ui.expFilter_num.clear()
+
+    def _addToIDFilter(self, ogroups=None, nums=None):
+        """Merge the given OGroup/Num ids into the corresponding ID filter fields (deduplicated)."""
+        if ogroups:
+            existing = self._parse_id_list(self.ui.expFilter_ogroups.text())
+            existing.update(str(o) for o in ogroups if o is not None)
+            self.ui.expFilter_ogroups.setText(", ".join(sorted(existing, key=lambda x: (len(x), x))))
+        if nums:
+            existing = self._parse_id_list(self.ui.expFilter_num.text())
+            existing.update(str(n) for n in nums if n is not None)
+            self.ui.expFilter_num.setText(", ".join(sorted(existing, key=lambda x: (len(x), x))))
+
+    @staticmethod
+    def _parse_id_list(text):
+        """Parse a comma-separated list of IDs (whitespace ignored) into a set of strings."""
+        return {part.strip() for part in text.split(",") if part.strip()}
 
     @staticmethod
     def _parse_filter_range(text):
@@ -15159,6 +15366,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
     def expFilterEdited(self, *args):
         tree = self.ui.resultsExperiment_TreeWidget
+        visible_nums = set()
 
         # Gather filter values
         mz_text = self.ui.expFilter_mz.text().strip()
@@ -15169,6 +15377,13 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         ms2_idx = self.ui.expFilter_ms2.currentIndex()
         # 0=all, 1=without MS2, 2=with MS2, 3=with native MS2, 4=with labeled MS2
         group_text = self.ui.expFilter_group.text().strip()
+        ogroups_text = self.ui.expFilter_ogroups.text().strip()
+        num_text = self.ui.expFilter_num.text().strip()
+        ogroup_ids = self._parse_id_list(ogroups_text)
+        num_ids = self._parse_id_list(num_text)
+
+        # Show/hide the standalone 'Reset ID filter' button based on whether either ID filter is set
+        self.ui.expResetIDFilterBtn.setVisible(bool(ogroup_ids or num_ids))
 
         # Handle MS2 filter change: if user selects non-"all" option, query MS2 forms from files
         prev_ms2_idx = getattr(self, "_prev_ms2_filter_idx", 0)
@@ -15187,7 +15402,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             parsed_group_filter = self._parse_group_presence_filter(group_text)
         self.ui.expFilter_group.setStyleSheet("background-color: #ffcccc;" if group_text and parsed_group_filter is None else "")
 
-        no_filters = not any([mz_text, rt_text, xn_text, z_text, polarity_idx != 0, ms2_idx != 0, parsed_group_filter is not None])
+        no_filters = not any([mz_text, rt_text, xn_text, z_text, polarity_idx != 0, ms2_idx != 0, parsed_group_filter is not None, ogroup_ids, num_ids])
 
         mz_sub, mz_min, mz_max = self._parse_filter_range(mz_text)
         rt_sub, rt_min, rt_max = self._parse_filter_range(rt_text)
@@ -15289,6 +15504,12 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 row = group_filter_rows_by_num.get(getattr(bd, "id", None))
                 show = row is not None and self._eval_group_presence_filter(row, parsed_group_filter, group_sample_names)
 
+            # OGroups/Num ID filter: a feature matches if its Num is in num_ids OR its OGroup is in ogroup_ids
+            if (ogroup_ids or num_ids) and show:
+                num_match = num_ids and str(getattr(bd, "id", None)) in num_ids
+                ogroup_match = ogroup_ids and str(getattr(bd, "metaboliteGroupID", None)) in ogroup_ids
+                show = bool(num_match or ogroup_match)
+
             return show
 
         def _apply_filter(item):
@@ -15304,6 +15525,8 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             if bd is not None and getattr(bd, "type", None) == "featurePair":
                 show = True if no_filters else _feature_matches(bd)
                 item.setHidden(not show)
+                if show:
+                    visible_nums.add(getattr(bd, "id", None))
                 return show
 
             # Group node (or a node without recognizable bunchData, e.g. sample rows):
@@ -15326,6 +15549,14 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         # Sync feature map if it is open
         if self.ui.expFeatureMapContainer.isVisible():
             self._buildFeatureMap()
+
+        # Dim non-matching dots in the Statistics volcano plots while a filter is active
+        if hasattr(self.ui, "statisticsWidget"):
+            self.ui.statisticsWidget.set_id_filter_state(None if no_filters else visible_nums)
+
+        # Hide Annotation browser entries whose feature isn't among the currently visible ones
+        if hasattr(self.ui, "annotationBrowserWidget"):
+            self.ui.annotationBrowserWidget.set_id_filter(None if no_filters else visible_nums)
 
     # Matches one condition of a group-presence filter expression, e.g. "GroupA:N > 3"
     _GROUP_FILTER_COND_RE = re.compile(r"^\s*(?P<group>[^:]+?)\s*:\s*(?P<form>[NnLl])\s*(?P<op>>=|<=|==|!=|>|<|=)\s*(?P<val>\d+)\s*$")
@@ -17558,6 +17789,9 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self._splitSeparatedPeaksTab()
         self._wrapRowInCollapsibleFlowLayout(self.ui.horizontalLayout_abundance_controls, "visualization options")
         self._wrapRowInCollapsibleFlowLayout(self.ui.horizontalLayout_isotopic_pattern_controls, "visualization options")
+        self._wrapRowInCollapsibleFlowLayout(self.ui.horizontalLayout_sample_peaks_nav, "visualization options")
+        self.ui.gridLayout_sample_peaks.setRowStretch(0, 0)
+        self.ui.gridLayout_sample_peaks.setRowStretch(1, 1)
         self._rearrangeIsotopicPatternPanel()
         self._addFeatureAnnotationsTab()
 
@@ -17566,6 +17800,25 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         # row1 panels actually fit side by side
         self.ui.resultsExperimentAbundance_widget.setMinimumWidth(round(self.ui.resultsExperimentAbundance_widget.minimumWidth() * 0.3))
         self.ui.resultsExperiment_widget.setMinimumWidth(round(self.ui.resultsExperiment_widget.minimumWidth() * 0.3))
+
+        # The "Experiment results" tree lives alongside the (collapsible) filter/tools
+        # sections in one QVBoxLayout; without explicit stretch, all-equal
+        # stretch/policy lets Qt grow every item proportionally instead of giving the
+        # tree all the remaining vertical space, which prevented its own scrollbar
+        # from ever kicking in. Give the filter/tools rows stretch 0 (so the tree gets
+        # all the extra space) but use Minimum (not Fixed) vertical policy: Fixed
+        # clamps the widget to whatever height was cached the first time its
+        # (FlowLayout-based, width-dependent) sizeHint was computed, which is often too
+        # small once the "Group features by" row is expanded - causing it to overlap
+        # the button rows above it. Minimum still lets the widget grow to its real
+        # (current-width) sizeHint while the tree keeps the remaining space via stretch.
+        self.ui.expFilterGroupBox.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Minimum)
+        self.ui.expFeatureMapContainer.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Minimum)
+        self.ui.resultsExperiment_TreeWidget.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Expanding)
+        self.ui.resultsExperiment_TreeWidget.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        for _i in range(self.ui.exp_left_layout.count()):
+            _w = self.ui.exp_left_layout.itemAt(_i).widget()
+            self.ui.exp_left_layout.setStretch(_i, 1 if _w is self.ui.resultsExperiment_TreeWidget else 0)
 
         self._convertTabWidgetToDockArea(self.ui.tabWidget_3, arrange=self._arrangeExperimentResultDocks)
 
@@ -17579,12 +17832,20 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         splitter.setStretchFactor(1, 3)
         splitter.setSizes([700, 300])
 
+        # The controls row (now a collapsible "Show visualization options" section) and the
+        # splitter share row0/row1 of the same QGridLayout; without explicit row stretch, Qt
+        # splits the available height 50/50 between them. Give the whole remaining space to
+        # the splitter (plot + table) so the collapsible options row takes minimal height.
+        self.ui.gridLayout_isotopic_pattern.setRowStretch(0, 0)
+        self.ui.gridLayout_isotopic_pattern.setRowStretch(1, 1)
+
     def _createAnnotationBrowserPage(self):
         """Build the "Annotation browser" top-level dock page: an experiment-wide,
         annotation-centric tree (Type -> Library/Database -> Compound -> Feature).
         """
         self.ui.annotationBrowserWidget = AnnotationBrowserWidget()
         self.ui.annotationBrowserWidget.featureSelected.connect(self._showFeatureInExperimentResults)
+        self.ui.annotationBrowserWidget.filterMetabolitesRequested.connect(lambda ogroups, nums: self._addToIDFilter(ogroups=ogroups, nums=nums))
         return self.ui.annotationBrowserWidget
 
     def _addFeatureAnnotationsTab(self):
@@ -18703,6 +18964,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.ui.comboBox_expGroupingColumn.currentIndexChanged.connect(self._onExpGroupingColumnChanged)
         self.ui.expAddGroupingLevelBtn.clicked.connect(self._addGroupingLevelRow)
         self.ui.expFilterResetBtn.clicked.connect(self._onExpFilterReset)
+        self.ui.expResetIDFilterBtn.clicked.connect(self._onExpResetIDFilter)
         self.ui.expExportMGFBtn.clicked.connect(self._export_exp_msms_mgf)
         self.ui.expFeatureMapBtn.toggled.connect(self._toggleFeatureMap)
         self.ui.expMSMSPrecursorOverviewBtn.clicked.connect(self._showMSMSPrecursorOverview)
@@ -18717,6 +18979,8 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.ui.expFilter_polarity.currentIndexChanged.connect(self.expFilterEdited)
         self.ui.expFilter_ms2.currentIndexChanged.connect(self.expFilterEdited)
         self.ui.expFilter_group.textChanged.connect(self.expFilterEdited)
+        self.ui.expFilter_ogroups.textChanged.connect(self.expFilterEdited)
+        self.ui.expFilter_num.textChanged.connect(self.expFilterEdited)
         self.ui.res_ExtractedData.itemDoubleClicked.connect(self.res_doubleClick)
         self.ui.msms_SpectraList.itemSelectionChanged.connect(self.plotSelectedMSMSSpectra)
 
@@ -18781,7 +19045,10 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.ui.msms_controls_exp.addWidget(self.ui.btn_msms_overview)
         self.ui.msms_controls_exp.addWidget(self.ui.btn_msms_export_mgf)
         self.ui.msms_controls_exp.addWidget(self.ui.btn_msms_filter_strings)
-        self.ui.verticalLayout_msms_exp.insertLayout(1, self.ui.msms_controls_exp)
+        _msmsControlsContent = QtWidgets.QWidget()
+        _msmsControlsContent.setLayout(self.ui.msms_controls_exp)
+        _msmsControlsSection = self._makeCollapsibleSection(_msmsControlsContent, "buttons")
+        self.ui.verticalLayout_msms_exp.insertWidget(1, _msmsControlsSection)
         self.ui.btn_msms_similarity_native.clicked.connect(lambda: self._show_msms_similarity_dialog("native"))
         self.ui.btn_msms_similarity_labeled.clicked.connect(lambda: self._show_msms_similarity_dialog("labeled"))
         self.ui.btn_msms_overview.clicked.connect(self._show_msms_overview)
@@ -18797,6 +19064,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         # Connect Statistics tab signals
         if hasattr(self.ui, "statisticsWidget"):
             self.ui.statisticsWidget.showFeatureInExperiment.connect(self._showFeatureInExperimentResults)
+            self.ui.statisticsWidget.idsFilterRequested.connect(lambda ogroups, nums: self._addToIDFilter(ogroups=ogroups, nums=nums))
 
         p = self.ui.scrollAreaWidgetContents_5.palette()
         p.setColor(self.ui.scrollAreaWidgetContents_5.backgroundRole(), QtCore.Qt.white)

@@ -78,6 +78,15 @@ def _scale_plot_fonts(fig, scale: float):
         fig._suptitle.set_fontsize(title_size)
 
 
+def _ids_for_positions(volcano_data: Dict[str, Any], positions: List[int]) -> Tuple[List[Any], List[Any]]:
+    """Return (ogroups, nums) for the given positional indices into `volcano_data`."""
+    feature_names = volcano_data.get("feature_names", [])
+    feature_group_ids = volcano_data.get("featureGroupIDs", [])
+    nums = [feature_names[i] for i in positions if i < len(feature_names)]
+    ogroups = [feature_group_ids[i] for i in positions if i < len(feature_group_ids)]
+    return ogroups, nums
+
+
 class AddComparisonDialog(QDialog):
     """Dialog for adding a new volcano plot comparison."""
 
@@ -175,6 +184,7 @@ class InteractiveVolcanoCanvas(FigureCanvas):
     """Canvas for volcano plot with interactive rectangular selection."""
 
     selectionChanged = Signal(list, bool)  # Signal emitted when selection changes
+    idsFilterRequested = Signal(list, list)  # (ogroups, nums) emitted on Ctrl+drag rectangle
 
     def __init__(self, parent=None, width=5, height=4, dpi=100):
         self.fig = Figure(figsize=(width, height), dpi=dpi)
@@ -188,6 +198,7 @@ class InteractiveVolcanoCanvas(FigureCanvas):
         self.rect_selector = None
         self._press_pos = None
         self.title = "Volcano Plot"
+        self.filtered_visible_nums = None  # None = no Experiment results filter active
 
         # Set up matplotlib event handling
         self.fig.canvas.mpl_connect("key_press_event", self._on_key_press)
@@ -211,7 +222,8 @@ class InteractiveVolcanoCanvas(FigureCanvas):
         )
 
     def _on_select(self, eclick, erelease):
-        """Handle rectangle selection."""
+        """Handle rectangle selection. Ctrl+drag adds the OGroup/Num of the enclosed dots to
+        the Experiment results ID filter instead of performing a normal (additive) selection."""
         if self.volcano_data is None:
             return
 
@@ -233,11 +245,13 @@ class InteractiveVolcanoCanvas(FigureCanvas):
 
         selected_indices = np.where(selected_mask)[0].tolist()
 
-        # Check if Ctrl is pressed for additive selection
         modifiers = QtWidgets.QApplication.keyboardModifiers()
-        additive = modifiers == Qt.ControlModifier
+        if modifiers == Qt.ControlModifier:
+            ogroups, nums = _ids_for_positions(self.volcano_data, selected_indices)
+            self.idsFilterRequested.emit(ogroups, nums)
+            return
 
-        self.selectionChanged.emit(selected_indices, additive)
+        self.selectionChanged.emit(selected_indices, False)
 
     def _on_mouse_press(self, event):
         """Record mouse-press position for drag detection."""
@@ -279,6 +293,11 @@ class InteractiveVolcanoCanvas(FigureCanvas):
         """Set the volcano plot data and redraw."""
         self.volcano_data = data
         self.draw_volcano(preserve_view=False)
+
+    def set_id_filter(self, visible_nums: Optional[set]):
+        """Dim (10% alpha) every dot whose Num is not in `visible_nums`; pass None to disable dimming."""
+        self.filtered_visible_nums = visible_nums
+        self.draw_volcano(preserve_view=True)
 
     def draw_volcano(self, preserve_view: bool = False):
         """Draw the volcano plot."""
@@ -331,7 +350,14 @@ class InteractiveVolcanoCanvas(FigureCanvas):
             else:
                 colors.append("gray")
 
-        self.scatter = self.axes.scatter(log2_fc, neg_log10_pval, c=colors, alpha=0.7, s=30, edgecolors="none")
+        # Dim dots for features hidden by the active Experiment results filter(s)
+        if self.filtered_visible_nums is not None:
+            feature_names = self.volcano_data.get("feature_names", [])
+            alphas = [0.7 if (i < len(feature_names) and feature_names[i] in self.filtered_visible_nums) else 0.1 for i in range(len(log2_fc))]
+        else:
+            alphas = 0.7
+
+        self.scatter = self.axes.scatter(log2_fc, neg_log10_pval, c=colors, alpha=alphas, s=30, edgecolors="none")
 
         # Draw highlighted points on top: green, 2× size
         if highlighted_set:
@@ -390,6 +416,7 @@ class MultiVolcanoWidget(QWidget):
     """
 
     featureSelected = Signal(list)  # Signal when features are selected (position indices)
+    idsFilterRequested = Signal(list, list)  # (ogroups, nums) emitted on Ctrl+drag rectangle
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -404,6 +431,7 @@ class MultiVolcanoWidget(QWidget):
 
         self.subplots: List[Dict[str, Any]] = []  # {"ax", "title", "volcano_data", "rect_selector"}
         self.highlighted_indices: List[int] = []
+        self.filtered_visible_nums = None  # None = no Experiment results filter active
         self.selection_manager = SelectionManager()
         self.selection_manager.register_callback(self._on_selection_changed)
 
@@ -508,7 +536,13 @@ class MultiVolcanoWidget(QWidget):
             else:
                 colors.append("gray")
 
-        ax.scatter(log2_fc, neg_log10_pval, c=colors, alpha=0.7, s=25, edgecolors="none")
+        if self.filtered_visible_nums is not None:
+            feature_names = vd.get("feature_names", [])
+            alphas = [0.7 if (i < len(feature_names) and feature_names[i] in self.filtered_visible_nums) else 0.1 for i in range(len(log2_fc))]
+        else:
+            alphas = 0.7
+
+        ax.scatter(log2_fc, neg_log10_pval, c=colors, alpha=alphas, s=25, edgecolors="none")
 
         if highlighted_set:
             h_idx = np.array(sorted(highlighted_set))
@@ -527,7 +561,9 @@ class MultiVolcanoWidget(QWidget):
             ax.set_ylim(old_ylim)
 
     def _on_rect_select(self, entry: Dict[str, Any], eclick, erelease):
-        """Handle rectangle selection within one subplot's axes."""
+        """Handle rectangle selection within one subplot's axes. Ctrl+drag adds the
+        OGroup/Num of the enclosed dots to the Experiment results ID filter instead of
+        performing a normal selection."""
         vd = entry["volcano_data"]
         if vd is None or not vd.get("success", False):
             return
@@ -546,8 +582,12 @@ class MultiVolcanoWidget(QWidget):
         selected_indices = np.where(selected_mask)[0].tolist()
 
         modifiers = QtWidgets.QApplication.keyboardModifiers()
-        additive = modifiers == Qt.ControlModifier
-        self._handle_selection(selected_indices, additive)
+        if modifiers == Qt.ControlModifier:
+            ogroups, nums = _ids_for_positions(vd, selected_indices)
+            self.idsFilterRequested.emit(ogroups, nums)
+            return
+
+        self._handle_selection(selected_indices, False)
 
     def _on_mouse_press(self, event):
         """Record mouse-press position/axes for drag detection."""
@@ -604,6 +644,15 @@ class MultiVolcanoWidget(QWidget):
     def update_highlighting(self, indices: List[int]):
         """Programmatically highlight feature positions in every subplot (no selection signal emitted)."""
         self.highlighted_indices = list(indices)
+        for entry in self.subplots:
+            self._draw_subplot(entry, preserve_view=True)
+        _scale_plot_fonts(self.fig, 0.5)
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+    def set_id_filter(self, visible_nums: Optional[set]):
+        """Dim (10% alpha) every dot whose Num is not in `visible_nums`; pass None to disable dimming."""
+        self.filtered_visible_nums = visible_nums
         for entry in self.subplots:
             self._draw_subplot(entry, preserve_view=True)
         _scale_plot_fonts(self.fig, 0.5)
@@ -844,6 +893,7 @@ class StatisticsTabWidget(QWidget):
 
     # Signal to switch to experiment results and show a specific feature
     showFeatureInExperiment = Signal(int)
+    idsFilterRequested = Signal(list, list)  # (ogroups, nums) forwarded from volcano Ctrl+drag rectangles
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -851,6 +901,7 @@ class StatisticsTabWidget(QWidget):
         self.selection_manager = SelectionManager()
         self._updating_from_volcano = False  # Guard against circular table↔volcano sync
         self._heatmap_state: Optional[Dict[str, Any]] = None
+        self._active_id_filter_visible_nums: Optional[set] = None
 
         self._setup_ui()
         self._connect_signals()
@@ -1737,11 +1788,13 @@ class StatisticsTabWidget(QWidget):
             return
 
         self.multi_volcano_widget = MultiVolcanoWidget(self)
+        self.multi_volcano_widget.idsFilterRequested.connect(self.idsFilterRequested)
         self.multi_volcano_widget.featureSelected.connect(self._on_features_selected)
 
         data = {"feature_data": active_data, "group_info": self.stats_data.group_info}
 
         self.multi_volcano_widget.set_comparisons(self.stats_data.volcano_comparisons, data)
+        self.multi_volcano_widget.set_id_filter(self._active_id_filter_visible_nums)
         self.viz_layout.addWidget(self.multi_volcano_widget)
 
         # Store volcano data for the first comparison (for feature table)
@@ -1775,12 +1828,14 @@ class StatisticsTabWidget(QWidget):
 
         canvas = InteractiveVolcanoCanvas(self, width=8, height=6)
         canvas.selectionChanged.connect(lambda indices, additive: self.selection_manager.add_selection(indices, additive))
+        canvas.idsFilterRequested.connect(self.idsFilterRequested)
         toolbar = NavigationToolbar(canvas, self)
 
         volcano_data = UnivariateAnalysis.calculate_volcano_data(active_data, self.stats_data.group_info[group1], self.stats_data.group_info[group2], metadata=self.stats_data.feature_metadata)
         self.current_volcano_data = volcano_data  # Store for feature table
 
         canvas.set_volcano_data(volcano_data)
+        canvas.set_id_filter(self._active_id_filter_visible_nums)
 
         self.viz_layout.addWidget(toolbar)
         self.viz_layout.addWidget(canvas)
@@ -1927,7 +1982,8 @@ class StatisticsTabWidget(QWidget):
             self.multi_volcano_widget.update_highlighting(indices)
 
     def _on_table_row_selected(self):
-        """Highlight volcano dots corresponding to table rows selected by the user."""
+        """Highlight volcano dots corresponding to table rows selected by the user, and
+        show the (first) selected feature in the Experiment results pane."""
         if self._updating_from_volcano:
             return
         if self.current_volcano_data is None or not self.current_volcano_data.get("success", False):
@@ -1948,6 +2004,9 @@ class StatisticsTabWidget(QWidget):
             canvas.update_highlighting(pos_indices)
         if self.multi_volcano_widget is not None:
             self.multi_volcano_widget.update_highlighting(pos_indices)
+
+        if selected_feature_ids:
+            self.showFeatureInExperiment.emit(selected_feature_ids[0])
 
     def highlight_features_by_id(self, feature_ids: List[int]):
         """Highlight features selected in the Experiment results pane in the currently shown volcano plot(s)
@@ -1970,6 +2029,16 @@ class StatisticsTabWidget(QWidget):
             self.multi_volcano_widget.update_highlighting(pos_indices)
 
         self._select_table_rows(feature_ids)
+
+    def set_id_filter_state(self, visible_nums: Optional[set]):
+        """Called by MExtract whenever the Experiment results filters change. `visible_nums` is
+        the set of feature Nums still visible in the tree (None = no filter active, show all
+        dots normally); dims every other dot to 10% alpha in whichever volcano plot(s) are shown."""
+        self._active_id_filter_visible_nums = visible_nums
+        if self.current_canvas is not None and hasattr(self.current_canvas, "set_id_filter"):
+            self.current_canvas.set_id_filter(visible_nums)
+        if self.multi_volcano_widget is not None:
+            self.multi_volcano_widget.set_id_filter(visible_nums)
 
     def _on_view_feature_requested(self, feature_index: int, target: str):
         """Handle request to view feature in experiment results."""
