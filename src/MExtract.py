@@ -2979,10 +2979,12 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         finally:
             progress.close()
 
-    def _showFeatureInExperimentResults(self, feature_index: int):
+    def _showFeatureInExperimentResults(self, feature_index: str):
         """Navigate to the experiment results pane and select the specified feature."""
         # Switch to the experiment results pane (bracketedResultsTab)
         self._showDockPane("bracketedResultsTab")
+
+        feature_id = str(feature_index)
 
         # Try to find and select the feature in the tree widget
         if hasattr(self, "experimentResults") and self.experimentResults is not None:
@@ -2992,7 +2994,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
                 # Check if this is a feature (standalone or metabolite group)
                 if hasattr(item, "bunchData") and hasattr(item.bunchData, "id"):
-                    if item.bunchData.id == feature_index:
+                    if str(item.bunchData.id) == feature_id:
                         self.ui.resultsExperiment_TreeWidget.setCurrentItem(item)
                         self.ui.resultsExperiment_TreeWidget.scrollToItem(item)
                         self.ui.resultsExperiment_TreeWidget.expandItem(item.parent() if item.parent() else item)
@@ -3002,7 +3004,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 for child_idx in range(item.childCount()):
                     child = item.child(child_idx)
                     if hasattr(child, "bunchData") and hasattr(child.bunchData, "id"):
-                        if child.bunchData.id == feature_index:
+                        if str(child.bunchData.id) == feature_id:
                             self.ui.resultsExperiment_TreeWidget.setCurrentItem(child)
                             self.ui.resultsExperiment_TreeWidget.scrollToItem(child)
                             self.ui.resultsExperiment_TreeWidget.expandItem(item)

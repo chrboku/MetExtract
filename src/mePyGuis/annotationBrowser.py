@@ -65,10 +65,10 @@ def _resolve_msms_meta_pairs(row):
 
 
 class AnnotationBrowserWidget(QtWidgets.QWidget):
-    """Experiment-wide, annotation-centric browser. Emits `featureSelected(int)` with the
+    """Experiment-wide, annotation-centric browser. Emits `featureSelected(str)` with the
     feature's "Num" when the user clicks a feature (leaf) row."""
 
-    featureSelected = QtCore.Signal(int)
+    featureSelected = QtCore.Signal(str)
     filterMetabolitesRequested = QtCore.Signal(list, list)  # (ogroups, nums)
 
     def __init__(self, parent=None):
@@ -297,7 +297,7 @@ class AnnotationBrowserWidget(QtWidgets.QWidget):
     def _on_item_clicked(self, item, _column):
         feature_num = item.data(0, QtCore.Qt.UserRole)
         if feature_num is not None:
-            self.featureSelected.emit(feature_num)
+            self.featureSelected.emit(str(feature_num))
 
     def _apply_filter(self, text):
         text = text.strip().lower()
