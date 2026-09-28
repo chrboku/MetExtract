@@ -1758,7 +1758,7 @@ def calculateMetaboliteGroups(
         for tGroup in groups:
             for i in range(len(tGroup)):
                 # Update in DataFrame
-                table_df = table_df.with_columns(pl.when(pl.col("Num") == tGroup[i]).then(pl.lit(curGroup)).otherwise(pl.col("OGroup")).alias("OGroup"))
+                table_df = table_df.with_columns(pl.when(pl.col("Num") == tGroup[i]).then(pl.lit(f"Met.{curGroup}")).otherwise(pl.col("OGroup")).alias("OGroup"))
 
             curGroup += 1
 
@@ -1817,12 +1817,13 @@ def calculateMetaboliteGroups(
                 table_df = table_df.with_columns(pl.when(pl.col("Num") == fpNum).then(pl.lit(avg_abundance)).otherwise(pl.col("Average_peakarea")).alias("Average_peakarea"))
 
         # Convert columns OGroup, Relative_peakarea_in_group and Average_peakarea to the correct types
-        table_df = table_df.with_columns(pl.col("OGroup").cast(pl.Int64))
+        table_df = table_df.with_columns(pl.col("OGroup").cast(pl.Utf8))
         table_df = table_df.with_columns(pl.col("Relative_peakarea_in_group").cast(pl.Float64))
         table_df = table_df.with_columns(pl.col("Average_peakarea").cast(pl.Float64))
 
-        # Sort table_df by OGroup asc and Relative_peakarea_in_group desc
-        table_df = table_df.sort(["OGroup", "Relative_peakarea_in_group"], descending=[False, True])
+        # Sort by the numeric group suffix, then relative peak area
+        table_df = table_df.with_columns(pl.col("OGroup").str.strip_prefix("Met.").cast(pl.Int64, strict=False).alias("_OGroupSort"))
+        table_df = table_df.sort(["_OGroupSort", "Relative_peakarea_in_group"], descending=[False, True]).drop("_OGroupSort")
 
         resDB.conn.insert_row("Parameters", {"Parameter": "# Grouping", "Value": ""})
         resDB.conn.insert_row("Parameters", {"Parameter": "MEConvoluting_groups", "Value": f"{useGroupsForConfig}".replace("'", "").replace('"', "")})

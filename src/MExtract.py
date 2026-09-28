@@ -3429,7 +3429,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                     y=-0.02,
                     s=label,
                     transform=self.ui.resultsExperimentSeparatedPeaks_plot.axes.get_xaxis_transform(),
-                    rotation=90,
+                    rotation=30,
                     horizontalalignment="right",
                     verticalalignment="top",
                     color=o[1],
@@ -3474,6 +3474,8 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             intlim = [intlim[0] * 1.1, intlim[1] * 1.1]
             self.drawCanvas(self.ui.resultsExperiment_plot, xlim=rtlim, ylim=intlim, showLegendOverwrite=False)
             self.drawCanvas(self.ui.resultsExperimentSeparatedPeaks_plot, showLegendOverwrite=self.ui.showLegend_experiment.isChecked())
+            self.ui.resultsExperimentSeparatedPeaks_plot.fig.tight_layout()
+            self.ui.resultsExperimentSeparatedPeaks_plot.canvas.draw()
             lmz_val = plotItems[0].lmz if plotItems[0].lmz else plotItems[0].mz
             self.drawCanvas(
                 self.ui.resultsExperimentMSScanPeaks_plot,
@@ -11221,8 +11223,10 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
             mz_val = float(mz_arr[cidx])
             int_val = float(int_arr[cidx])
+            peak_colors = getattr(ax, "_msms_peak_colors", None)
+            peak_color = peak_colors[cidx] if peak_colors is not None else spec_color
 
-            vl = ax.vlines(mz_val, 0, int_val, colors=spec_color, linewidth=4.5, zorder=5)
+            vl = ax.vlines(mz_val, 0, int_val, colors=peak_color, linewidth=4.5, zorder=5)
             plot_obj._hover_artists.append(vl)
 
             ann = ax.annotate(
@@ -11254,9 +11258,11 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
             mz_val = float(mz_arr[cidx])
             int_val = float(int_arr[cidx])
+            peak_colors = getattr(ax, "_msms_peak_colors", None)
+            peak_color = peak_colors[cidx] if peak_colors is not None else spec_color
 
             # Pin a thick vline and labelled annotation that survive zoom/pan
-            vl = ax.vlines(mz_val, 0, int_val, colors=spec_color, linewidth=4.5, zorder=5)
+            vl = ax.vlines(mz_val, 0, int_val, colors=peak_color, linewidth=4.5, zorder=5)
             plot_obj._pinned_artists.append(vl)
 
             ann = ax.annotate(
@@ -12445,6 +12451,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         mz_b, int_b, _ = _plot_side(scan_b, color_b, -1, "top")
         # Combine both spectra's peaks into a single per-axis dataset for hover picking
         ax._msms_peaks = (mz_a + mz_b, int_a + int_b, color_a)
+        ax._msms_peak_colors = [color_a] * len(mz_a) + [color_b] * len(mz_b)
 
         ax.axhline(0, color="black", linewidth=0.8)
         ax.set_xlabel("m/z", fontsize=12)
@@ -12857,7 +12864,11 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         mzs, its = self._select_msms_fragments(scan, selection)
         if fmt == "tsv":
             lines = ["mz\tintensity"] + [f"{float(mz):.6f}\t{float(it):.6f}" for mz, it in zip(mzs, its)]
-        else:  # list / massbank-like (use space delimiter)
+        elif fmt == "massbank":
+            base_peak = max((float(it) for it in its), default=0.0)
+            normalized_its = [max(0.0, float(it) * 1000.0 / base_peak) for it in its] if base_peak > 0 else [0.0] * len(its)
+            lines = [f"{float(mz):.6f} {it:.6f}" for mz, it in zip(mzs, normalized_its)]
+        else:  # list (use space delimiter)
             lines = [f"{float(mz):.6f} {float(it):.6f}" for mz, it in zip(mzs, its)]
         QtWidgets.QApplication.clipboard().setText("\n".join(lines))
 
@@ -15802,8 +15813,8 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         if item.myType == "feature":
             cp = item.myData
             myID = item.myID
-            self.currentOpenResultsFile.curs.execute("delete from ChromPeaks where id=%d" % cp.id)
-            self.currentOpenResultsFile.curs.execute("delete from featureGroupFeatures where fID=%d" % cp.id)
+            self.currentOpenResultsFile.curs.execute("delete from ChromPeaks where id=?", (str(cp.id),))
+            self.currentOpenResultsFile.curs.execute("delete from featureGroupFeatures where fID=?", (str(cp.id),))
             self.currentOpenResultsFile.curs.execute("delete from featureGroups where id not in (select distinct fGroupID from featureGroupFeatures)")
             self.ui.res_ExtractedData.setItemSelected(item, False)
 
@@ -16847,6 +16858,13 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             intlim = [intlim[0] * 1.1, intlim[1] * 1.1]
             self.drawCanvas(self.ui.resultsExperiment_plot, xlim=rtlim, ylim=intlim, showLegendOverwrite=False)
             self.drawCanvas(self.ui.resultsExperimentSeparatedPeaks_plot, showLegendOverwrite=self.ui.showLegend_experiment.isChecked())
+            separated_axes = self.ui.resultsExperimentSeparatedPeaks_plot.axes
+            separated_axes.tick_params(axis="x", labelrotation=45)
+            for tick_label in separated_axes.get_xticklabels():
+                tick_label.set_rotation(45)
+                tick_label.set_horizontalalignment("right")
+            self.ui.resultsExperimentSeparatedPeaks_plot.fig.tight_layout()
+            self.ui.resultsExperimentSeparatedPeaks_plot.canvas.draw()
             self.drawCanvas(
                 self.ui.resultsExperimentMSScanPeaks_plot,
                 xlim=[pi.mz - 5, pi.lmz + 10],
@@ -19218,8 +19236,7 @@ def main():
             + "be selected in the feature list in the Experiment results."
             + "<br><br>"
             + "Tip: Save your <b>panel layout</b> using the files menu and <br>"
-            + "conveniently restore a previous layout from there as well."
-            ,
+            + "conveniently restore a previous layout from there as well.",
             QtWidgets.QMessageBox.Ok,
         )
 

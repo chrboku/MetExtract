@@ -353,7 +353,8 @@ class InteractiveVolcanoCanvas(FigureCanvas):
         # Dim dots for features hidden by the active Experiment results filter(s)
         if self.filtered_visible_nums is not None:
             feature_names = self.volcano_data.get("feature_names", [])
-            alphas = [0.7 if (i < len(feature_names) and feature_names[i] in self.filtered_visible_nums) else 0.1 for i in range(len(log2_fc))]
+            visible_nums = {str(num) for num in self.filtered_visible_nums}
+            alphas = [0.7 if (i < len(feature_names) and str(feature_names[i]) in visible_nums) else 0.1 for i in range(len(log2_fc))]
         else:
             alphas = 0.7
 
@@ -538,7 +539,8 @@ class MultiVolcanoWidget(QWidget):
 
         if self.filtered_visible_nums is not None:
             feature_names = vd.get("feature_names", [])
-            alphas = [0.7 if (i < len(feature_names) and feature_names[i] in self.filtered_visible_nums) else 0.1 for i in range(len(log2_fc))]
+            visible_nums = {str(num) for num in self.filtered_visible_nums}
+            alphas = [0.7 if (i < len(feature_names) and str(feature_names[i]) in visible_nums) else 0.1 for i in range(len(log2_fc))]
         else:
             alphas = 0.7
 
@@ -783,7 +785,7 @@ class SelectedFeaturesTable(QTreeWidget):
         item.setData(0, Qt.UserRole + 1, feature_pair_id)
         return item
 
-    def update_features(self, indices: List[int], feature_metadata: Optional[Dict[str, Any]] = None, group_stats: Optional[Dict[str, Any]] = None, row_colors: Optional[Dict[int, Any]] = None):
+    def update_features(self, indices: List[Any], feature_metadata: Optional[Dict[str, Any]] = None, group_stats: Optional[Dict[str, Any]] = None, row_colors: Optional[Dict[int, Any]] = None):
         """Update grouped tree with selected features."""
         self.clear()
         self.feature_data = []
@@ -818,7 +820,7 @@ class SelectedFeaturesTable(QTreeWidget):
             for idx in group_indices:
                 feature_item = self._make_feature_item(idx, feature_metadata, group_stats)
                 group_item.addChild(feature_item)
-                self._feature_item_by_id[idx] = feature_item
+                self._feature_item_by_id[str(idx)] = feature_item
 
                 if row_colors and idx in row_colors:
                     brush = QtGui.QBrush(row_colors[idx])
@@ -829,11 +831,11 @@ class SelectedFeaturesTable(QTreeWidget):
 
         self.expandAll()
 
-    def select_feature_ids(self, feature_ids: List[int]):
+    def select_feature_ids(self, feature_ids: List[Any]):
         self.clearSelection()
         first_item = None
         for fid in feature_ids:
-            item = self._feature_item_by_id.get(fid)
+            item = self._feature_item_by_id.get(str(fid))
             if item is None:
                 continue
             item.setSelected(True)
@@ -844,7 +846,7 @@ class SelectedFeaturesTable(QTreeWidget):
             self.scrollToItem(first_item)
             self.setCurrentItem(first_item)
 
-    def get_selected_feature_ids(self) -> List[int]:
+    def get_selected_feature_ids(self) -> List[Any]:
         feature_ids = []
         for item in self.selectedItems():
             if item.childCount() > 0:
@@ -852,10 +854,7 @@ class SelectedFeaturesTable(QTreeWidget):
             fid = item.data(0, Qt.UserRole)
             if fid is None:
                 continue
-            try:
-                feature_ids.append(int(fid))
-            except (ValueError, TypeError):
-                continue
+            feature_ids.append(fid)
         return feature_ids
 
     def get_current_feature_pair_id(self) -> Optional[int]:
@@ -892,7 +891,7 @@ class StatisticsTabWidget(QWidget):
     """Main widget for the Statistics tab."""
 
     # Signal to switch to experiment results and show a specific feature
-    showFeatureInExperiment = Signal(int)
+    showFeatureInExperiment = Signal(str)
     idsFilterRequested = Signal(list, list)  # (ogroups, nums) forwarded from volcano Ctrl+drag rectangles
 
     def __init__(self, parent=None):
@@ -1973,7 +1972,7 @@ class StatisticsTabWidget(QWidget):
         self._select_table_rows(feature_ids)
 
         if feature_ids:
-            self.showFeatureInExperiment.emit(feature_ids[0])
+            self.showFeatureInExperiment.emit(str(feature_ids[0]))
 
         # Highlight dots in the volcano plot(s)
         if self.current_canvas is not None:
@@ -1992,11 +1991,11 @@ class StatisticsTabWidget(QWidget):
         if not feature_names:
             return
         # Build a reverse map: feature_id -> positional index
-        feature_id_to_pos = {fid: pos for pos, fid in enumerate(feature_names)}
+        feature_id_to_pos = {str(fid): pos for pos, fid in enumerate(feature_names)}
         selected_feature_ids = self.features_table.get_selected_feature_ids()
         pos_indices = []
         for feature_id in selected_feature_ids:
-            pos = feature_id_to_pos.get(feature_id)
+            pos = feature_id_to_pos.get(str(feature_id))
             if pos is not None:
                 pos_indices.append(pos)
         canvas = self.current_canvas
@@ -2006,9 +2005,9 @@ class StatisticsTabWidget(QWidget):
             self.multi_volcano_widget.update_highlighting(pos_indices)
 
         if selected_feature_ids:
-            self.showFeatureInExperiment.emit(selected_feature_ids[0])
+            self.showFeatureInExperiment.emit(str(selected_feature_ids[0]))
 
-    def highlight_features_by_id(self, feature_ids: List[int]):
+    def highlight_features_by_id(self, feature_ids: List[Any]):
         """Highlight features selected in the Experiment results pane in the currently shown volcano plot(s)
         and select the matching row(s) in the Selected Features table underneath.
 
@@ -2020,8 +2019,8 @@ class StatisticsTabWidget(QWidget):
         feature_names = self.current_volcano_data.get("feature_names", [])
         if not feature_names:
             return
-        feature_id_to_pos = {fid: pos for pos, fid in enumerate(feature_names)}
-        pos_indices = [feature_id_to_pos[fid] for fid in feature_ids if fid in feature_id_to_pos]
+        feature_id_to_pos = {str(fid): pos for pos, fid in enumerate(feature_names)}
+        pos_indices = [feature_id_to_pos[str(fid)] for fid in feature_ids if str(fid) in feature_id_to_pos]
 
         if self.current_canvas is not None and hasattr(self.current_canvas, "update_highlighting"):
             self.current_canvas.update_highlighting(pos_indices)

@@ -206,7 +206,7 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
                 cells.append(self._make_num_item(n_metabolites))
                 cells.append(self._make_item("%.2f" % mz_mean if mz_mean is not None else ""))
                 cells.append(self._make_item("%.2f" % mz_std if mz_std is not None else ""))
-                cells.append(self._make_item("%.2f ± %.2f" % (ratio_sig, ratio_sig_std) if ratio_sig is not None else ""))
+                cells.append(self._make_item("%.2f ± %.2f" % (ratio_sig, ratio_sig_std) if ratio_sig is not None and ratio_sig_std is not None else ("%.2f" % ratio_sig if ratio_sig is not None else "")))
                 cells.append(
                     self._make_item(
                         "%s / %s"

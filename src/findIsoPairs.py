@@ -538,7 +538,7 @@ class FindIsoPairs:
         db_con.create_table(
             "chromPeaks",
             {
-                "id": pl.Int64,
+                "id": pl.Utf8,
                 "tracer": pl.Int64,
                 "eicID": pl.Int64,
                 "NPeakCenter": pl.Int64,
@@ -599,7 +599,7 @@ class FindIsoPairs:
         db_con.create_table(
             "allChromPeaks",
             {
-                "id": pl.Int64,
+                "id": pl.Utf8,
                 "tracer": pl.Int64,
                 "eicID": pl.Int64,
                 "NPeakCenter": pl.Int64,
@@ -658,9 +658,9 @@ class FindIsoPairs:
 
         db_con.create_table("featureGroups", {"id": pl.Int64, "featureName": pl.Utf8, "tracer": pl.Int64})
 
-        db_con.create_table("featureGroupFeatures", {"id": pl.Int64, "fID": pl.Int64, "fDesc": pl.Utf8, "fGroupID": pl.Int64})
+        db_con.create_table("featureGroupFeatures", {"id": pl.Int64, "fID": pl.Utf8, "fDesc": pl.Utf8, "fGroupID": pl.Int64})
 
-        db_con.create_table("featurefeatures", {"fID1": pl.Int64, "fID2": pl.Int64, "corr": pl.Float64, "silRatioValue": pl.Float64, "desc1": pl.Utf8, "desc2": pl.Utf8, "add1": pl.Utf8, "add2": pl.Utf8})
+        db_con.create_table("featurefeatures", {"fID1": pl.Utf8, "fID2": pl.Utf8, "corr": pl.Float64, "silRatioValue": pl.Float64, "desc1": pl.Utf8, "desc2": pl.Utf8, "add1": pl.Utf8, "add2": pl.Utf8})
 
         db_con.create_table("massspectrum", {"mID": pl.Int64, "fgID": pl.Int64, "time": pl.Float64, "mzs": pl.Utf8, "intensities": pl.Utf8, "ionMode": pl.Utf8})
 
@@ -1502,7 +1502,7 @@ class FindIsoPairs:
 
                             # save the detected feature pairs in these EICs to the database
                             for peak in curChromPeaks:
-                                peak.id = self.curPeakId
+                                peak.id = str(self.curPeakId)
                                 peak.eicID = self.curEICId
                                 adjcCount = peak.xCount
                                 peak.correctedXCount = peak.xCount
@@ -3079,7 +3079,14 @@ class FindIsoPairs:
                     "_fDesc": _update_fDesc,
                     "_corrToOthers": _update_corrToOthers,
                     "_heteroAtoms": _update_heteroAtoms,
-                }
+                },
+                schema={
+                    "id": pl.Utf8,
+                    "_adducts": pl.Utf8,
+                    "_fDesc": pl.Utf8,
+                    "_corrToOthers": pl.Utf8,
+                    "_heteroAtoms": pl.Utf8,
+                },
             )
 
             # single join-based update for chromPeaks
