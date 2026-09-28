@@ -47,34 +47,58 @@ import platform
 
 
 def winGetClipboard():
-    ctypes.windll.user32.OpenClipboard(0)
-    pcontents = ctypes.windll.user32.GetClipboardData(1)  # 1 is CF_TEXT
-    data = ctypes.c_char_p(pcontents).value
-    # ctypes.windll.kernel32.GlobalUnlock(pcontents)
-    ctypes.windll.user32.CloseClipboard()
+    CF_UNICODETEXT = 13
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    user32.OpenClipboard(0)
+    try:
+        handle = user32.GetClipboardData(CF_UNICODETEXT)
+        if not handle:
+            return ""
+        kernel32.GlobalLock.restype = ctypes.c_void_p
+        kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+        locked = kernel32.GlobalLock(handle)
+        try:
+            data = ctypes.c_wchar_p(locked).value
+        finally:
+            kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+            kernel32.GlobalUnlock(handle)
+    finally:
+        user32.CloseClipboard()
     return data
 
 
 def winSetClipboard(text):
-    GMEM_DDESHARE = 0x2000
-    ctypes.windll.user32.OpenClipboard(0)
-    ctypes.windll.user32.EmptyClipboard()
+    GMEM_MOVEABLE = 0x0002
+    CF_UNICODETEXT = 13
+    text = str(text)
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+
+    # Configure proper return/argument types so 64-bit handles/pointers are not truncated.
+    kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    user32.SetClipboardData.restype = ctypes.c_void_p
+    user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+
+    # Number of bytes for a null-terminated wide (UTF-16) string.
+    buffer_size = (len(text) + 1) * ctypes.sizeof(ctypes.c_wchar)
+    hCd = kernel32.GlobalAlloc(GMEM_MOVEABLE, buffer_size)
+    pchData = kernel32.GlobalLock(hCd)
     try:
-        # works on Python 2 (bytes() only takes one argument)
-        hCd = ctypes.windll.kernel32.GlobalAlloc(GMEM_DDESHARE, len(bytes(text)) + 1)
-    except TypeError:
-        # works on Python 3 (bytes() requires an encoding)
-        hCd = ctypes.windll.kernel32.GlobalAlloc(GMEM_DDESHARE, len(bytes(text, "ascii")) + 1)
-    pchData = ctypes.windll.kernel32.GlobalLock(hCd)
+        ctypes.memmove(pchData, ctypes.create_unicode_buffer(text), buffer_size)
+    finally:
+        kernel32.GlobalUnlock(hCd)
+
+    user32.OpenClipboard(0)
     try:
-        # works on Python 2 (bytes() only takes one argument)
-        ctypes.cdll.msvcrt.strcpy(ctypes.c_char_p(pchData), bytes(text))
-    except TypeError:
-        # works on Python 3 (bytes() requires an encoding)
-        ctypes.cdll.msvcrt.strcpy(ctypes.c_char_p(pchData), bytes(text, "ascii"))
-    ctypes.windll.kernel32.GlobalUnlock(hCd)
-    ctypes.windll.user32.SetClipboardData(1, hCd)
-    ctypes.windll.user32.CloseClipboard()
+        user32.EmptyClipboard()
+        user32.SetClipboardData(CF_UNICODETEXT, hCd)
+    finally:
+        user32.CloseClipboard()
 
 
 def macSetClipboard(text):

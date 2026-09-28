@@ -596,6 +596,32 @@ def getElementOfIsotope(isotope):
     return fT.elemDetails[isotope][1]
 
 
+def choose(n, r):
+    from math import factorial
+
+    return factorial(n) // factorial(r) // factorial(n - r)
+
+
+def calcIsoEnrichment(a, s, r):
+    """Calculate the fractional isotopic enrichment from a pair of isotopolog
+    intensities separated by s labelling positions.
+
+    a: total number of labelling positions (Xn)
+    s: number of labelling positions between the two used isotopologs
+    r: intensity ratio of the more distant isotopolog relative to the reference isotopolog
+    """
+    return choose(a, s) ** (1.0 / s) / (choose(a, s) ** (1.0 / s) + r ** (1.0 / s))
+
+
+def isotopologLabel(x, xCount):
+    """Name an isotopolog at labelling position x (out of xCount total positions) using
+    the combined native/labelled notation "M+x / M'-(Xn-x)"."""
+    y = xCount - x
+    native = f"M+{x}" if x >= 0 else f"M{x}"
+    labeled = f"M'-{y}" if y >= 0 else f"M'+{-y}"
+    return f"{native} / {labeled}"
+
+
 if __name__ == "__main__":
     fT = formulaTools()
 

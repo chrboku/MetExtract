@@ -4,17 +4,147 @@ from .MetExtractII_Main import MetExtractVersion
 from .utils import Bunch
 
 
-def writeFeatureListToFeatureML(features, toFile, ppmPM=5, rtPM=0.25 * 60):
-    fileLineArray = []
-
+def _writeFeatureMLHeader(fileLineArray, features):
     fileLineArray.append('<?xml version="1.0" encoding="ISO-8859-1"?>')
     fileLineArray.append('<featureMap version="1.4" id="fm_16311276685788915066" xsi:noNamespaceSchemaLocation="http://open-ms.sourceforge.net/schemas/FeatureXML_1_4.xsd" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">')
     fileLineArray.append('	<dataProcessing completion_time="%s">' % (strftime("%a, %d %b %Y %H:%M:%S +0000", gmtime())))
     fileLineArray.append('		<software name="MetExtract II" version="%s" />' % (MetExtractVersion))
     fileLineArray.append('		<processingAction name="Feature pair detection" />')
-    # fileLineArray.append('		<UserParam type="string" name="parameter: key" value="value"/>')
     fileLineArray.append("	</dataProcessing>")
     fileLineArray.append('	<featureList count="%d">' % (len(features)))
+
+
+def _writeFeatureMLFooter(fileLineArray):
+    fileLineArray.append("	</featureList>")
+    fileLineArray.append("</featureMap>")
+
+
+def _writeFeatureMLToFile(fileLineArray, toFile):
+    with open(toFile, "w") as fOut:
+        for line in fileLineArray:
+            fOut.write(line)
+            fOut.write("\r\n")
+
+
+def _parseFloats(value):
+    """Parses a (possibly ';'-separated) string of floats, ignoring empty/invalid entries."""
+    if value is None:
+        return []
+    s = str(value).strip()
+    if s == "" or s.lower() in ("none", "nan"):
+        return []
+    out = []
+    for part in s.split(";"):
+        part = part.strip()
+        if part == "":
+            continue
+        try:
+            out.append(float(part))
+        except ValueError:
+            pass
+    return out
+
+
+def _findSampleNames(columnNames):
+    """Derives per-sample column name prefixes from the '<sample>_N_startRT' columns."""
+    suffix = "_N_startRT"
+    return [c[: -len(suffix)] for c in columnNames if c.endswith(suffix)]
+
+
+def _averagePeakShape(get, sampleNames):
+    """Averages the per-sample native/labeled start/apex/end RTs (only over samples with a
+    detected peak) and returns them in seconds, or None where no data is available."""
+    nStarts, nApexes, nEnds = [], [], []
+    lStarts, lApexes, lEnds = [], [], []
+    for s in sampleNames:
+        nStarts.extend(_parseFloats(get(f"{s}_N_startRT")))
+        nApexes.extend(_parseFloats(get(f"{s}_N_apexRT")))
+        nEnds.extend(_parseFloats(get(f"{s}_N_endRT")))
+        lStarts.extend(_parseFloats(get(f"{s}_L_startRT")))
+        lApexes.extend(_parseFloats(get(f"{s}_L_apexRT")))
+        lEnds.extend(_parseFloats(get(f"{s}_L_endRT")))
+
+    def avgSec(vals):
+        return (sum(vals) / len(vals)) * 60.0 if vals else None
+
+    return (
+        avgSec(nStarts),
+        avgSec(nApexes),
+        avgSec(nEnds),
+        avgSec(lStarts),
+        avgSec(lApexes),
+        avgSec(lEnds),
+    )
+
+
+def _hShapePolygonPoints(bStart, bEnd, bLow, bHigh, bApex, tStart, tEnd, tLow, tHigh, tApex, rtBar):
+    """Builds a single, non-self-intersecting polygon outline of a rotated 'H': a bottom
+    leg rectangle (bStart..bEnd, bLow..bHigh) and a top leg rectangle (tStart..tEnd,
+    tLow..tHigh), joined by a waist connecting their apex positions. Points are ordered
+    so a simple path renderer (no hull re-computation) draws the shape correctly."""
+    bwLeft = min(max(bStart, bApex - rtBar), bEnd)
+    bwRight = max(min(bEnd, bApex + rtBar), bStart)
+    twLeft = min(max(tStart, tApex - rtBar), tEnd)
+    twRight = max(min(tEnd, tApex + rtBar), tStart)
+
+    return [
+        (bStart, bLow),
+        (bEnd, bLow),
+        (bEnd, bHigh),
+        (bwRight, bHigh),
+        (twRight, tLow),
+        (tEnd, tLow),
+        (tEnd, tHigh),
+        (tStart, tHigh),
+        (tStart, tLow),
+        (twLeft, tLow),
+        (bwLeft, bHigh),
+        (bStart, bHigh),
+    ]
+
+
+def _featurePeakBounds(feature, rtPM):
+    """Returns (nStart, nApex, nEnd, lStart, lApex, lEnd) in seconds for a feature.
+
+    If the feature carries averaged per-sample peak boundaries (nStartRT/nEndRT/... and
+    lStartRT/lEndRT/...), those are used. Otherwise falls back to a fixed +/- rtPM window
+    around the feature's RT so features without per-sample data still render.
+    """
+    rt = feature.rt
+    nStart = getattr(feature, "nStartRT", None)
+    nEnd = getattr(feature, "nEndRT", None)
+    nApex = getattr(feature, "nApexRT", None)
+    lStart = getattr(feature, "lStartRT", None)
+    lEnd = getattr(feature, "lEndRT", None)
+    lApex = getattr(feature, "lApexRT", None)
+
+    if nStart is None or nEnd is None or nEnd <= nStart:
+        nStart, nEnd = rt - rtPM, rt + rtPM
+    if nApex is None:
+        nApex = rt
+    if lStart is None or lEnd is None or lEnd <= lStart:
+        lStart, lEnd = rt - rtPM, rt + rtPM
+    if lApex is None:
+        lApex = rt
+
+    return nStart, nApex, nEnd, lStart, lApex, lEnd
+
+
+def writeFeatureListToFeatureML(features, toFile, ppmPM=5, rtPM=0.25 * 60):
+    """Writes two featureML files for the given feature pairs:
+
+    a) <toFile>: the native (lower m/z) and labeled (higher m/z) chromatographic peaks are
+       each shown as a rectangle spanning their (averaged, per-sample) detected start/end RTs.
+    b) <toFile>_adapted.featureML: the same two peak rectangles, joined by a waist attaching
+       to the apex RT of the native and the labeled peak, rendered as a single rotated-H hull.
+    """
+    writeFeatureListToFeatureMLStandard(features, toFile, ppmPM=ppmPM, rtPM=rtPM)
+    writeFeatureListToFeatureMLAdapted(features, toFile.replace(".featureML", "_adapted.featureML"), ppmPM=3.0, rtPM=rtPM)
+
+
+def writeFeatureListToFeatureMLStandard(features, toFile, ppmPM=5, rtPM=0.25 * 60):
+    fileLineArray = []
+    _writeFeatureMLHeader(fileLineArray, features)
 
     for feature in features:
         num = feature.id
@@ -27,6 +157,8 @@ def writeFeatureListToFeatureML(features, toFile, ppmPM=5, rtPM=0.25 * 60):
         xn = feature.Xn
         ionMode = feature.ionMode
 
+        nStart, _nApex, nEnd, lStart, _lApex, lEnd = _featurePeakBounds(feature, rtPM)
+
         fileLineArray.append('		<feature id="%s">' % (num))
         fileLineArray.append('			<UserParam type="string" name="label" value="%s (Num: %s, OGroup: %s, MZ: %.5f, RT (min): %.2f, Charge: %d, Xn: %s, ionMode: %s)"/>' % (name, num, grpNum, mz, rt, z, xn, ionMode))
         fileLineArray.append('			<position dim="0">%f</position>' % (rt))
@@ -36,27 +168,72 @@ def writeFeatureListToFeatureML(features, toFile, ppmPM=5, rtPM=0.25 * 60):
         fileLineArray.append('			<quality dim="0">-1</quality>')
         fileLineArray.append('			<quality dim="1">-1</quality>')
         fileLineArray.append("			<overallquality>-1</overallquality>")
+        # native (lower m/z) chromatographic peak, averaged start/end RT across samples
         fileLineArray.append('			<convexhull nr="1">')
-        fileLineArray.append('				<pt x="%f" y="%f" />' % (rt - rtPM, mz * (1 - ppmPM / 1000000.0)))
-        fileLineArray.append('				<pt x="%f" y="%f" />' % (rt + rtPM, mz * (1 - ppmPM / 1000000.0)))
-        fileLineArray.append('				<pt x="%f" y="%f" />' % (rt - rtPM, mz * (1 + ppmPM / 1000000.0)))
-        fileLineArray.append('				<pt x="%f" y="%f" />' % (rt + rtPM, mz * (1 + ppmPM / 1000000.0)))
+        fileLineArray.append('				<pt x="%f" y="%f" />' % (nStart, mz * (1 - ppmPM / 1000000.0)))
+        fileLineArray.append('				<pt x="%f" y="%f" />' % (nEnd, mz * (1 - ppmPM / 1000000.0)))
+        fileLineArray.append('				<pt x="%f" y="%f" />' % (nStart, mz * (1 + ppmPM / 1000000.0)))
+        fileLineArray.append('				<pt x="%f" y="%f" />' % (nEnd, mz * (1 + ppmPM / 1000000.0)))
         fileLineArray.append("			</convexhull>")
+        # labeled (higher m/z) chromatographic peak, averaged start/end RT across samples
         fileLineArray.append('			<convexhull nr="2_lab">')
-        fileLineArray.append('				<pt x="%f" y="%f" />' % (rt - rtPM, lmz * (1 - ppmPM / 1000000.0)))
-        fileLineArray.append('				<pt x="%f" y="%f" />' % (rt + rtPM, lmz * (1 - ppmPM / 1000000.0)))
-        fileLineArray.append('				<pt x="%f" y="%f" />' % (rt - rtPM, lmz * (1 + ppmPM / 1000000.0)))
-        fileLineArray.append('				<pt x="%f" y="%f" />' % (rt + rtPM, lmz * (1 + ppmPM / 1000000.0)))
+        fileLineArray.append('				<pt x="%f" y="%f" />' % (lStart, lmz * (1 - ppmPM / 1000000.0)))
+        fileLineArray.append('				<pt x="%f" y="%f" />' % (lEnd, lmz * (1 - ppmPM / 1000000.0)))
+        fileLineArray.append('				<pt x="%f" y="%f" />' % (lStart, lmz * (1 + ppmPM / 1000000.0)))
+        fileLineArray.append('				<pt x="%f" y="%f" />' % (lEnd, lmz * (1 + ppmPM / 1000000.0)))
         fileLineArray.append("			</convexhull>")
         fileLineArray.append("		</feature>")
 
-    fileLineArray.append("	</featureList>")
-    fileLineArray.append("</featureMap>")
+    _writeFeatureMLFooter(fileLineArray)
+    _writeFeatureMLToFile(fileLineArray, toFile)
 
-    with open(toFile, "w") as fOut:
-        for line in fileLineArray:
-            fOut.write(line)
-            fOut.write("\r\n")
+
+def writeFeatureListToFeatureMLAdapted(features, toFile, ppmPM=3.0, rtPM=0.25 * 60):
+    fileLineArray = []
+    _writeFeatureMLHeader(fileLineArray, features)
+
+    for feature in features:
+        num = feature.id
+        grpNum = feature.ogroup
+        mz = feature.mz
+        lmz = feature.lmz
+        rt = feature.rt
+        z = feature.charge
+        name = feature.name
+        xn = feature.Xn
+        ionMode = feature.ionMode
+
+        nStart, nApex, nEnd, lStart, lApex, lEnd = _featurePeakBounds(feature, rtPM)
+        nLow, nHigh = mz * (1 - ppmPM / 1000000.0), mz * (1 + ppmPM / 1000000.0)
+        lLow, lHigh = lmz * (1 - ppmPM / 1000000.0), lmz * (1 + ppmPM / 1000000.0)
+
+        # width of the connecting waist, relative to the narrower of the two peaks
+        rtBar = max(min(nEnd - nStart, lEnd - lStart) * 0.05, rtPM * 0.02)
+
+        # bottom/top legs of the rotated H are ordered by m/z, not by native/labeled
+        if mz <= lmz:
+            hPoints = _hShapePolygonPoints(nStart, nEnd, nLow, nHigh, nApex, lStart, lEnd, lLow, lHigh, lApex, rtBar)
+        else:
+            hPoints = _hShapePolygonPoints(lStart, lEnd, lLow, lHigh, lApex, nStart, nEnd, nLow, nHigh, nApex, rtBar)
+
+        fileLineArray.append('		<feature id="%s">' % (num))
+        fileLineArray.append('			<UserParam type="string" name="label" value="%s (Num: %s, OGroup: %s, MZ: %.5f, RT (min): %.2f, Charge: %d, Xn: %s, ionMode: %s)"/>' % (name, num, grpNum, mz, rt, z, xn, ionMode))
+        fileLineArray.append('			<position dim="0">%f</position>' % (rt))
+        fileLineArray.append('			<position dim="1">%f</position>' % (mz))
+        fileLineArray.append("			<charge>%d</charge>" % (z))
+        fileLineArray.append("			<intensity>1</intensity>")
+        fileLineArray.append('			<quality dim="0">-1</quality>')
+        fileLineArray.append('			<quality dim="1">-1</quality>')
+        fileLineArray.append("			<overallquality>-1</overallquality>")
+        # single rotated-H hull: native and labeled peak rectangles joined by an apex-to-apex waist
+        fileLineArray.append('			<convexhull nr="1">')
+        for px, py in hPoints:
+            fileLineArray.append('				<pt x="%f" y="%f" />' % (px, py))
+        fileLineArray.append("			</convexhull>")
+        fileLineArray.append("		</feature>")
+
+    _writeFeatureMLFooter(fileLineArray)
+    _writeFeatureMLToFile(fileLineArray, toFile)
 
 
 def convertMSMSoptFileToFeatureML(msmsFile, featureMLFile=None):
@@ -106,9 +283,11 @@ def convertMEMatrixToFeatureML(meMatrixFile, featureMLFile=None):
         import polars as pl
 
         df = pl.read_excel(meMatrixFile, sheet_name="Sheet1")
+        sampleNames = _findSampleNames(df.columns)
 
         # Convert dataframe to list of features
         for row in df.iter_rows(named=True):
+            nStart, nApex, nEnd, lStart, lApex, lEnd = _averagePeakShape(row.get, sampleNames)
             b = Bunch(
                 id=str(row["Num"]),
                 ogroup=str(row["OGroup"]),
@@ -119,6 +298,12 @@ def convertMEMatrixToFeatureML(meMatrixFile, featureMLFile=None):
                 charge=int(row["Charge"]),
                 name=str(row["Num"]),
                 ionMode=str(row["Ionisation_Mode"]),
+                nStartRT=nStart,
+                nApexRT=nApex,
+                nEndRT=nEnd,
+                lStartRT=lStart,
+                lApexRT=lApex,
+                lEndRT=lEnd,
             )
             features.append(b)
     else:
@@ -127,15 +312,19 @@ def convertMEMatrixToFeatureML(meMatrixFile, featureMLFile=None):
             csvReader = csv.reader(fIn, delimiter="\t", quotechar='"')
 
             headers = {}
+            sampleNames = []
             for linei, row in enumerate(csvReader):
                 if len(row) == 0:  # Skip empty lines
                     continue
                 if linei == 0:
                     for colInd, header in enumerate(row):
                         headers[header] = colInd
+                    sampleNames = _findSampleNames(headers.keys())
                 elif row[0].startswith("#"):
                     pass
                 else:
+                    rowGet = lambda col: row[headers[col]] if col in headers else None  # noqa: E731
+                    nStart, nApex, nEnd, lStart, lApex, lEnd = _averagePeakShape(rowGet, sampleNames)
                     b = Bunch(
                         id=row[headers["Num"]],
                         ogroup=row[headers["OGroup"]],
@@ -146,6 +335,12 @@ def convertMEMatrixToFeatureML(meMatrixFile, featureMLFile=None):
                         charge=int(row[headers["Charge"]]),
                         name=row[headers["Num"]],
                         ionMode=row[headers["Ionisation_Mode"]],
+                        nStartRT=nStart,
+                        nApexRT=nApex,
+                        nEndRT=nEnd,
+                        lStartRT=lStart,
+                        lApexRT=lApex,
+                        lEndRT=lEnd,
                     )
                     features.append(b)
 
@@ -179,9 +374,11 @@ def convertMEMatrixToFeatureMLSepPolarities(
         import polars as pl
 
         df = pl.read_excel(meMatrixFile, sheet_name=sheet_name)
+        sampleNames = _findSampleNames(df.columns)
 
         # Convert dataframe to list of features
         for row in df.iter_rows(named=True):
+            nStart, nApex, nEnd, lStart, lApex, lEnd = _averagePeakShape(row.get, sampleNames)
             b = Bunch(
                 id=str(row[numCol]),
                 ogroup=str(row[ogrpCol]),
@@ -192,6 +389,12 @@ def convertMEMatrixToFeatureMLSepPolarities(
                 charge=int(row[chargeCol]),
                 name=str(row[nameCol]),
                 ionMode=str(row[ionModeCol]),
+                nStartRT=nStart,
+                nApexRT=nApex,
+                nEndRT=nEnd,
+                lStartRT=lStart,
+                lApexRT=lApex,
+                lEndRT=lEnd,
             )
             features[b.ionMode].append(b)
     else:
@@ -200,15 +403,19 @@ def convertMEMatrixToFeatureMLSepPolarities(
             csvReader = csv.reader(fIn, delimiter=delimiter, quotechar='"')
 
             headers = {}
+            sampleNames = []
             for linei, row in enumerate(csvReader):
                 if len(row) == 0:  # Skip empty lines
                     continue
                 if linei == 0:
                     for colInd, header in enumerate(row):
                         headers[header] = colInd
+                    sampleNames = _findSampleNames(headers.keys())
                 elif row[0].startswith("#"):
                     pass
                 else:
+                    rowGet = lambda col: row[headers[col]] if col in headers else None  # noqa: E731
+                    nStart, nApex, nEnd, lStart, lApex, lEnd = _averagePeakShape(rowGet, sampleNames)
                     b = Bunch(
                         id=row[headers[numCol]],
                         ogroup=row[headers[ogrpCol]],
@@ -219,6 +426,12 @@ def convertMEMatrixToFeatureMLSepPolarities(
                         charge=int(row[headers[chargeCol]]),
                         name=row[headers[nameCol]],
                         ionMode=row[headers[ionModeCol]],
+                        nStartRT=nStart,
+                        nApexRT=nApex,
+                        nEndRT=nEnd,
+                        lStartRT=lStart,
+                        lApexRT=lApex,
+                        lEndRT=lEnd,
                     )
                     features[b.ionMode].append(b)
 
