@@ -435,7 +435,7 @@ ANNOTATED_DATABASES_DETAIL = [
     _entry(
         "DBs_<database>",
         "Mass-only hits found in database '<database>' (JSON list of strings).",
-        "JSON-encoded list of formatted hit descriptions, each of the form: '(Name: <compound name>, Type: <hit type>, Num: <db entry id>, Formula: <sum formula>, RT: <db RT, if known>, MassErrorPPM: <ppm>, MassErrorMass: <Da>, Additional information: <db-specific extra fields>)'.",
+        "JSON-encoded list of formatted hit descriptions, each of the form: '(Name: <compound name>, Type: <hit type>, Num: <db entry id>, Formula: <sum formula>, RT: <db RT, if known>, MassErrorPPM: <ppm>, MassErrorMass: <Da>, Iso_AE: <sum of absolute differences between measured and theoretical isotopolog ratios>, isotope_ratios_<isotopolog>: {measured, theoretical} (for each of the 6 checked isotopologs: M+13C, M+13C2, M+15N, M+34S, M+37Cl, M-54Fe), Additional information: <db-specific extra fields>)'.",
     ),
     _entry(
         "DBs_RT_<database>_count",

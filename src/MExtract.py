@@ -17630,6 +17630,12 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         diag = MSMSSpectraOverviewDialog(library_files, parent=self)
         diag.exec()
 
+    def showIsotopePatternExplorerDialog(self, events=None):
+        from .mePyGuis.isotopePatternExplorerDialog import IsotopePatternExplorerDialog
+
+        diag = IsotopePatternExplorerDialog(parent=self)
+        diag.exec()
+
     def generateDBTemplate(self, events):
         dbTemplateFile, _ = QtWidgets.QFileDialog.getSaveFileName(
             caption="Select database template",
@@ -18687,6 +18693,10 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.ui.showMSMSOverview_pushButton.clicked.connect(self.showMSMSSpectraOverviewDialog)
         self.ui.removeMGF_pushButton.clicked.connect(self.removeMGF)
         self.ui.actionMSMSSpectraOverview.triggered.connect(self.showMSMSSpectraOverviewDialog)
+
+        self.ui.actionIsotopePatternExplorer = QtGui.QAction("Isotope pattern explorer", self)
+        self.ui.actionIsotopePatternExplorer.triggered.connect(self.showIsotopePatternExplorerDialog)
+        self.ui.menuTools.addAction(self.ui.actionIsotopePatternExplorer)
 
         # setup result plots
         # Setup first plot

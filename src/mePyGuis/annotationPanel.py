@@ -15,6 +15,7 @@ from PySide6 import QtCore, QtWidgets
 
 from .annotationData import AnnotationStore, get_structure_smiles
 from .structureRenderer import render_structure_pixmap
+from ..isotopeScoring import ISOTOPOLOG_NAMES
 
 
 class _AnnotationCard(QtWidgets.QWidget):
@@ -86,6 +87,46 @@ def _fmt_abundance(value):
         return f"{float(value):.2e}" if value not in (None, "") else value
     except (TypeError, ValueError):
         return value
+
+
+def _fmt_isotope_score(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return value
+    return "n/a" if value == -1 else f"{value:.4f}"
+
+
+def _fmt_ppm(value):
+    try:
+        return f"{float(value):.2f}" if value not in (None, "") else value
+    except (TypeError, ValueError):
+        return value
+
+
+def _fmt_da(value):
+    try:
+        return f"{float(value):.4f}" if value not in (None, "") else value
+    except (TypeError, ValueError):
+        return value
+
+
+def _fmt_iso_ratio(measured, theoretical):
+    def _one(v):
+        try:
+            return f"{float(v):.4f}" if v not in (None, "") else "-"
+        except (TypeError, ValueError):
+            return "-"
+
+    return f"{_one(measured)} / {_one(theoretical)}"
+
+
+def _iso_ratio_fields(row):
+    """(label, value) pairs for the 6 checked isotopologs, always shown (dash for empty cells)."""
+    return [(f"Iso_Ratio {name} M / T", _fmt_iso_ratio(row.get(f"Iso_R_{name}_M"), row.get(f"Iso_R_{name}_T"))) for name in ISOTOPOLOG_NAMES]
+
+
+_ISO_RATIO_KEYS = {f"Iso_R_{name}_{suffix}" for name in ISOTOPOLOG_NAMES for suffix in ("M", "T")}
 
 
 def _add_metadata_grid(layout, fields):
@@ -313,6 +354,7 @@ class FeatureAnnotationsPanel(QtWidgets.QWidget):
             "Precursor_MZ_Diff",
             "Formula",
             "TheoreticalMass",
+            "Iso_AE",
             "InChI",
             "InChIKey",
             "SMILES",
@@ -335,6 +377,7 @@ class FeatureAnnotationsPanel(QtWidgets.QWidget):
             "Feature_Ionisation_Mode",
             "Feature_Average_peakarea",
         }
+        known_keys |= _ISO_RATIO_KEYS
 
         def build_body(layout):
             _add_metadata_grid(
@@ -348,6 +391,7 @@ class FeatureAnnotationsPanel(QtWidgets.QWidget):
                     ("Precursor m/z diff", _fmt_mz(row.get("Precursor_MZ_Diff"))),
                     ("Formula", row.get("Formula")),
                     ("Theoretical mass", row.get("TheoreticalMass")),
+                    ("Isotope score (Absolute Error)", _fmt_isotope_score(row.get("Iso_AE"))),
                     ("InChI", row.get("InChI")),
                     ("InChIKey", row.get("InChIKey")),
                     ("Library instrument", row.get("Library_Instrument")),
@@ -369,6 +413,7 @@ class FeatureAnnotationsPanel(QtWidgets.QWidget):
                     ("Polarity", row.get("Feature_Ionisation_Mode")),
                     ("Average abundance", _fmt_abundance(row.get("Feature_Average_peakarea"))),
                 ]
+                + _iso_ratio_fields(row)
                 + _extra_fields(row, known_keys),
             )
 
@@ -397,6 +442,7 @@ class FeatureAnnotationsPanel(QtWidgets.QWidget):
             "HitType",
             "MatchErrorPPM",
             "MatchErrorMass",
+            "Iso_AE",
             "Feature_Num",
             "Feature_OGroup",
             "Feature_MZ",
@@ -407,6 +453,7 @@ class FeatureAnnotationsPanel(QtWidgets.QWidget):
             "Feature_Average_peakarea",
         }
         known_keys |= {k for k in row if k.startswith("DB_Info_")}
+        known_keys |= _ISO_RATIO_KEYS
 
         def build_body(layout):
             _add_metadata_grid(
@@ -421,8 +468,9 @@ class FeatureAnnotationsPanel(QtWidgets.QWidget):
                     ("m/z", _fmt_mz(row.get("DB_MZ"))),
                     ("Polarity", row.get("DB_Polarity")),
                     ("Hit type", row.get("HitType")),
-                    ("Match error (ppm)", row.get("MatchErrorPPM")),
-                    ("Match error (Da)", row.get("MatchErrorMass")),
+                    ("Match error (ppm)", _fmt_ppm(row.get("MatchErrorPPM"))),
+                    ("Match error (Da)", _fmt_da(row.get("MatchErrorMass"))),
+                    ("Isotope score (Absolute Error)", _fmt_isotope_score(row.get("Iso_AE"))),
                     ("Feature Num", row.get("Feature_Num")),
                     ("OGroup", row.get("Feature_OGroup")),
                     ("Feature m/z", _fmt_mz(row.get("Feature_MZ"))),
@@ -433,6 +481,7 @@ class FeatureAnnotationsPanel(QtWidgets.QWidget):
                     ("Average abundance", _fmt_abundance(row.get("Feature_Average_peakarea"))),
                 ]
                 + [(k[len("DB_Info_") :], v) for k, v in row.items() if k.startswith("DB_Info_") and k != "DB_Info_SMILES"]
+                + _iso_ratio_fields(row)
                 + _extra_fields(row, known_keys),
             )
             _add_structure_image(layout, get_structure_smiles(row))
@@ -448,8 +497,9 @@ class FeatureAnnotationsPanel(QtWidgets.QWidget):
                 [
                     ("Sum formula", row.get("SumFormula")),
                     ("Element class", row.get("Element_Class")),
-                    ("Mass error (ppm)", row.get("MassErrorPPM")),
-                    ("Mass error (Da)", row.get("MassErrorMass")),
+                    ("Mass error (ppm)", _fmt_ppm(row.get("MassErrorPPM"))),
+                    ("Mass error (Da)", _fmt_da(row.get("MassErrorMass"))),
+                    ("Isotope score (Absolute Error)", _fmt_isotope_score(row.get("Iso_AE"))),
                     ("Feature Num", row.get("Feature_Num")),
                     ("OGroup", row.get("Feature_OGroup")),
                     ("m/z", _fmt_mz(row.get("Feature_MZ"))),
@@ -458,7 +508,8 @@ class FeatureAnnotationsPanel(QtWidgets.QWidget):
                     ("Z", row.get("Feature_Charge")),
                     ("Polarity", row.get("Feature_Ionisation_Mode")),
                     ("Average abundance", _fmt_abundance(row.get("Feature_Average_peakarea"))),
-                ],
+                ]
+                + _iso_ratio_fields(row),
             )
 
         return _AnnotationCard(title, build_body)

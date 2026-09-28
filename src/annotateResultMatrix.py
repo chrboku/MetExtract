@@ -6,6 +6,14 @@ import pprint
 import polars as pl
 from .formulaTools import formulaTools
 from .PolarsDB import PolarsDB
+from .isotopeScoring import (
+    ISOTOPOLOG_NAMES,
+    UNDEFINED_SCORE,
+    compute_isotope_pattern,
+    format_isotope_ratios_for_text,
+    isotope_ratio_columns,
+    isotope_ratio_json_fields,
+)
 from .resultsPostProcessing import generateSumFormulas as sumFormulaGeneration
 from .resultsPostProcessing import searchDatabases
 from .utils import add_sheet_to_excel
@@ -338,6 +346,7 @@ def annotateWithDatabases(
             # Search database
             hits_per_db = {}
             hit_objects = []
+            other_isotopologs = row.get("Other_Isotopologs")
 
             for hit in self.dbs.searchDB(
                 mass=mass,
@@ -355,13 +364,16 @@ def annotateWithDatabases(
                 if hit.dbName not in hits_per_db:
                     hits_per_db[hit.dbName] = {"hits": [], "hitsRT": []}
 
-                hit_str = f"(Name: {hit.name}, Type: {hit.hitType}, Num: {hit.num}, Formula: {hit.sumFormula}, RT: {hit.rt_min}, MassErrorPPM: {hit.matchErrorPPM:.5f}, MassErrorMass: {hit.matchErrorMass:.5f}, Additional information: {hit.additionalInfo})"
+                isotope_abs_error, isotope_ratios = compute_isotope_pattern(hit.sumFormula, other_isotopologs)
+                isotope_ratios_text = format_isotope_ratios_for_text(isotope_ratios)
+
+                hit_str = f"(Name: {hit.name}, Type: {hit.hitType}, Num: {hit.num}, Formula: {hit.sumFormula}, RT: {hit.rt_min}, MassErrorPPM: {hit.matchErrorPPM:.5f}, MassErrorMass: {hit.matchErrorMass:.5f}, Iso_AE: {isotope_abs_error:.6g}, {isotope_ratios_text}, Additional information: {hit.additionalInfo})"
                 hits_per_db[hit.dbName]["hits"].append(hit_str)
 
                 if hit.rt_min is not None and hit.rt_min != "":
                     try:
                         rtDelta = abs(float(hit.rt_min) - rt_min)
-                        rt_hit_str = f"RT delta: {rtDelta:.2f} (Name: {hit.name} Type: {hit.hitType}, Num: {hit.num}, Formula: {hit.sumFormula}, RT: {hit.rt_min}, MassErrorPPM: {hit.matchErrorPPM:.5f}, MassErrorMass: {hit.matchErrorMass:.5f}, RTError: {float(hit.rt_min) - rt_min if hit.rt_min is not None and hit.rt_min != '' else ''}, Additional information: {hit.additionalInfo})"
+                        rt_hit_str = f"RT delta: {rtDelta:.2f} (Name: {hit.name} Type: {hit.hitType}, Num: {hit.num}, Formula: {hit.sumFormula}, RT: {hit.rt_min}, MassErrorPPM: {hit.matchErrorPPM:.5f}, MassErrorMass: {hit.matchErrorMass:.5f}, Iso_AE: {isotope_abs_error:.6g}, {isotope_ratios_text}, RTError: {float(hit.rt_min) - rt_min if hit.rt_min is not None and hit.rt_min != '' else ''}, Additional information: {hit.additionalInfo})"
                         hits_per_db[hit.dbName]["hitsRT"].append((rtDelta, rt_hit_str))
                     except Exception as e:
                         logging.error(f"Error processing RT for database hit: {e}")
@@ -380,6 +392,8 @@ def annotateWithDatabases(
                     "Feature_Loss": row.get("Loss"),
                     "Feature_Relative_peakarea_in_group": row.get("Relative_peakarea_in_group"),
                     "Feature_Average_peakarea": row.get("Average_peakarea"),
+                    "Iso_AE": isotope_abs_error,
+                    "Isotope_Ratios": isotope_ratios,
                 }
                 hit_objects.append((hit, row_info))
 
@@ -474,6 +488,8 @@ def annotateWithDatabases(
                 "HitType": sanitize_str(hit.hitType),
                 "MatchErrorPPM": float(hit.matchErrorPPM) if hit.matchErrorPPM is not None else None,
                 "MatchErrorMass": float(hit.matchErrorMass) if hit.matchErrorMass is not None else None,
+                "Iso_AE": row_info["Iso_AE"],
+                **isotope_ratio_columns(row_info["Isotope_Ratios"]),
                 # Feature information where the hit was found
                 "Feature_Num": row_info["Feature_Num"],
                 "Feature_OGroup": row_info["Feature_OGroup"],
@@ -505,12 +521,16 @@ def annotateWithDatabases(
             "DB_MZ": pl.Float64,
             "MatchErrorPPM": pl.Float64,
             "MatchErrorMass": pl.Float64,
+            "Iso_AE": pl.Float64,
             "Feature_RT": pl.Float64,
             "Feature_MZ": pl.Float64,
             "Feature_M": pl.Utf8,
             "Feature_Relative_peakarea_in_group": pl.Float64,
             "Feature_Average_peakarea": pl.Float64,
         }
+        for name in ISOTOPOLOG_NAMES:
+            schema_overrides[f"Iso_R_{name}_M"] = pl.Float64
+            schema_overrides[f"Iso_R_{name}_T"] = pl.Float64
 
         # Create dataframe for compound-focused sheet
         compound_df = pl.DataFrame(compound_rows, schema_overrides=schema_overrides, infer_schema_length=len(compound_rows))
@@ -669,6 +689,7 @@ def annotateWithMSMSLibrary(
         if row_idx is None:
             continue
         row = results_df.row(row_idx, named=True)
+        other_isotopologs = row.get("Other_Isotopologs")
 
         for mgf_name, lib_info in libraries.items():
             library_spectra, lib_entry = lib_info
@@ -742,6 +763,11 @@ def annotateWithMSMSLibrary(
                     # alongside the formula ("<formula> (<mass>)")
                     formula = base_row.get("Formula")
                     base_row["TheoreticalMass"] = _formula_to_mass(formula) if formula else None
+                    isotope_abs_error, isotope_ratios = compute_isotope_pattern(formula, other_isotopologs) if formula else (UNDEFINED_SCORE, {})
+                    base_row["Iso_AE"] = isotope_abs_error
+                    base_row.update(isotope_ratio_columns(isotope_ratios))
+                    m["isotope_abs_error"] = isotope_abs_error
+                    m["isotope_ratios"] = isotope_ratios
 
                     # Always resolve acquisition metadata of the library (reference) spectrum
                     # (instrument, fragmentation mode, collision energy, RT), regardless of the
@@ -791,6 +817,8 @@ def annotateWithMSMSLibrary(
                         "compound_name": m.get("compound_name"),
                         "compound_id": m.get("db_spectrum_index"),
                         "library": mgf_name,
+                        "isotope_abs_error": m.get("isotope_abs_error", UNDEFINED_SCORE),
+                        **isotope_ratio_json_fields(m.get("isotope_ratios") or {}),
                     }
                     for m in sorted(col_matches, key=lambda m: m["score"], reverse=True)
                 ]
@@ -830,6 +858,13 @@ def annotateWithMSMSLibrary(
             schema_overrides["Scan_Precursor_MZ"] = pl.Float64
         if any("Scan_Collision_Energy" in r for r in spectra_rows):
             schema_overrides["Scan_Collision_Energy"] = pl.Float64
+        if any("Iso_AE" in r for r in spectra_rows):
+            schema_overrides["Iso_AE"] = pl.Float64
+        for name in ISOTOPOLOG_NAMES:
+            for suffix in ("M", "T"):
+                col = f"Iso_R_{name}_{suffix}"
+                if any(col in r for r in spectra_rows):
+                    schema_overrides[col] = pl.Float64
 
         # Ensure all user-selected retain_keys are present as columns (even if empty)
         all_retain_keys = set()
@@ -1060,6 +1095,7 @@ def annotateWithSumFormulas(
         schema_overrides = {
             "MassErrorPPM": pl.Float64,
             "MassErrorMass": pl.Float64,
+            "Iso_AE": pl.Float64,
             "Feature_RT": pl.Float64,
             "Feature_MZ": pl.Float64,
             # Feature_M can hold comma-separated neutral masses so keep it as a string
@@ -1067,6 +1103,9 @@ def annotateWithSumFormulas(
             "Feature_Relative_peakarea_in_group": pl.Float64,
             "Feature_Average_peakarea": pl.Float64,
         }
+        for name in ISOTOPOLOG_NAMES:
+            schema_overrides[f"Iso_R_{name}_M"] = pl.Float64
+            schema_overrides[f"Iso_R_{name}_T"] = pl.Float64
         sf_hits_df = pl.DataFrame(
             sf_compound_hits,
             schema_overrides=schema_overrides,
