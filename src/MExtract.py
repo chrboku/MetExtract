@@ -68,6 +68,9 @@ from .mePyGuis.annotationPanel import FeatureAnnotationsPanel
 from .mePyGuis.annotationBrowser import AnnotationBrowserWidget
 from .mePyGuis.libraryCache import LibraryCache
 from .MetExtractII_Main import MetExtractVersion
+from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWebEngineCore import QWebEnginePage
+from PySide6.QtGui import QDesktopServices
 from .utils import (
     Bunch,
     CallBackMethod,
@@ -639,6 +642,32 @@ class _DBTestWorker(QtCore.QThread):
     def run(self):
         results = annotateResultMatrix.testDatabaseImports(self.dbFiles)
         self.finished.emit(results)
+
+
+class _ExternalLinkWebEnginePage(QWebEnginePage):
+    """QWebEnginePage that opens any clicked link in the system's default browser
+    instead of navigating the embedded view (used for the "Welcome" page)."""
+
+    def acceptNavigationRequest(self, url, navigationType, isMainFrame):
+        if navigationType == QWebEnginePage.NavigationType.NavigationTypeLinkClicked:
+            QDesktopServices.openUrl(url)
+            return False
+        return super().acceptNavigationRequest(url, navigationType, isMainFrame)
+
+    def createWindow(self, webWindowType):
+        # links with target="_blank" request a new window instead of triggering
+        # acceptNavigationRequest; open its URL externally once it navigates, then discard it
+        page = _ExternalLinkWebEnginePage(self)
+        page.urlChanged.connect(self._openExternallyAndDiscard(page))
+        return page
+
+    @staticmethod
+    def _openExternallyAndDiscard(page):
+        def _handler(url):
+            QDesktopServices.openUrl(url)
+            page.deleteLater()
+
+        return _handler
 
 
 class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
@@ -17771,6 +17800,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
         # (objectName, title, page widget, default visible)
         pageDefs = [
+            ("welcomeTab", "Welcome", self._createWelcomePage(), True),
             ("inputTab", "Input", self.ui.inputTab, True),
             ("pickingTab", "Process", self.ui.pickingTab, True),
             ("resultsTab", "Sample results", self.ui.resultsTab, False),
@@ -17804,7 +17834,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         # instead of leaving a blank pane reserved for it on the left
         self.takeCentralWidget()
 
-        self._dockWidgets["inputTab"].raise_()
+        self._dockWidgets["welcomeTab"].raise_()
 
         self._buildViewMenu()
         self._buildLayoutMenuActions()
@@ -17864,6 +17894,20 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         # the splitter (plot + table) so the collapsible options row takes minimal height.
         self.ui.gridLayout_isotopic_pattern.setRowStretch(0, 0)
         self.ui.gridLayout_isotopic_pattern.setRowStretch(1, 1)
+
+    def _createWelcomePage(self):
+        """Build the "Welcome" top-level dock page: an HTML welcome screen
+        (resources/startup.html) shown by default on startup, replacing the old
+        startup QMessageBox with tips/info.
+        """
+        resources_dir = os.path.join(get_main_dir(), "resources")
+        html_path = os.path.join(resources_dir, "startup.html")
+        with open(html_path, "r", encoding="utf-8") as f:
+            html = f.read().replace("{{VERSION}}", MetExtractVersion)
+        view = QWebEngineView()
+        view.setPage(_ExternalLinkWebEnginePage(view))
+        view.setHtml(html, QtCore.QUrl.fromLocalFile(resources_dir + "/"))
+        return view
 
     def _createAnnotationBrowserPage(self):
         """Build the "Annotation browser" top-level dock page: an experiment-wide,
@@ -18071,7 +18115,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         """Add a "View" menu that lets the user re-open any closed/hidden pane."""
         self.ui.menuView = QtWidgets.QMenu(self.ui.menuBar)
         self.ui.menuView.setTitle("View")
-        for objName in ("inputTab", "pickingTab", "resultsTab", "bracketedResultsTab", "statisticsTab", "annotationBrowserTab"):
+        for objName in ("welcomeTab", "inputTab", "pickingTab", "resultsTab", "bracketedResultsTab", "statisticsTab", "annotationBrowserTab"):
             action = self._dockWidgets[objName].toggleViewAction()
             self.ui.menuView.addAction(action)
         # Insert "View" right after "File" (before "Tools")
@@ -19201,54 +19245,6 @@ def main():
 
     mainWin.setWindowTitle("MetExtract II (%s)" % MetExtractVersion)
     mainWin.show()
-
-    if not opts.exit:
-        QtWidgets.QMessageBox.information(
-            None,
-            "MetExtract",
-            "Tip: When you start a new experiment, please <b>change the<br>"
-            + "working directory</b> to your experimental folder.<br>"
-            + "You can set the working directory via the menu<br>"
-            + "('Tools'->'Set working directory')."
-            + "<br><br>"
-            + "Tip: Please also consider <b>copying</b> any databases or<br>"
-            + "other resources to your working directory (e.g., DB folder)."
-            + "<br><br>"
-            + "Tip: To quickly change the values of drop-down and<br>"
-            + "integer/float spinner controls, <b>hold the CTRL-key<br>"
-            + "and use the mouse-wheel</b>."
-            + "<br><br>"
-            + "Tip: If importing mzML files results in the error<br>"
-            + "of missing files, please find the correct version at<br>"
-            + f"<b>{OBO_DOWNLOAD_URL}</b>.<br>"
-            + "Please download the corresponding obo-file and<br>"
-            + "save it to the folder in the error message.<br>"
-            + "You can also open this page via the menu<br>"
-            + "(<b>'Tools'->'Download OBO files'</b>)."
-            + "<br><br>"
-            + "In the experiment-results MS/MS tab you can <b>filter<br>"
-            + "spectra by their filter string</b> (cvParam MS:1000512)<br>"
-            + "using a regular expression. Leave it empty to show all<br>"
-            + "spectra; a capturing group is shown in the first column.<br>"
-            + "The 'Show filter strings' button lists all loaded filter<br>"
-            + "strings (e.g., '(FTMS).*' or '(FTMS|ITMS).*')."
-            + "<br><br>"
-            + "Tip: To generate a template for a database, select<br>"
-            + "<b>'Download Database Template'</b> from the 'Tools' menu."
-            + "<br><br>"
-            + "Tip: Results XLSX files can be modified. Additional columns<br>"
-            + "(e.g., for user-based grouping) may be used as a grouping<br>"
-            + "factor in the <b>Experimental results</b> (e.g., isotopic<br>"
-            + "pattern clustering, statistically sig. metabolites, etc.)."
-            + "<br><br>"
-            + "Tip: Use <b>Ctrl + 'draw a rectangle'</b> to select significantly<br>"
-            + "different features in volcano plots. These will then automatically<br>"
-            + "be selected in the feature list in the Experiment results."
-            + "<br><br>"
-            + "Tip: Save your <b>panel layout</b> using the files menu and <br>"
-            + "conveniently restore a previous layout from there as well.",
-            QtWidgets.QMessageBox.Ok,
-        )
 
     # status bar info thread
     def updateMemoryInfo():
