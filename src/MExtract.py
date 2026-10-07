@@ -12466,10 +12466,13 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             if scan is None or len(scan.mz_list) == 0:
                 return [], [], color
             mz = scan.mz_list
-            intens = [sign * v for v in scan.intensity_list]
+            max_int = max(scan.intensity_list)
+            scale = 100.0 / max_int if max_int > 0 else 1.0
+            rel_intensities = [v * scale for v in scan.intensity_list]
+            intens = [sign * v for v in rel_intensities]
             ax.vlines(mz, 0, intens, colors=color, linewidth=1.5)
             ax.plot(mz, intens, "o", markersize=3, color=color)
-            intensity_with_idx = sorted(((v, i) for i, v in enumerate(scan.intensity_list)), reverse=True)
+            intensity_with_idx = sorted(((v, i) for i, v in enumerate(rel_intensities)), reverse=True)
             for _, peak_idx in intensity_with_idx[:10]:
                 mz_val = scan.mz_list[peak_idx]
                 intensity_val = intens[peak_idx]
@@ -12484,7 +12487,8 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
         ax.axhline(0, color="black", linewidth=0.8)
         ax.set_xlabel("m/z", fontsize=12)
-        ax.set_ylabel("Intensity (A up / B down)", fontsize=12)
+        ax.set_ylabel("Relative intensity (%) (A up / B down)", fontsize=12)
+        ax.set_ylim(-110, 110)
         title_a = "Scan %d: %.4f m/z | RT %.2f min" % (scan_a.id, scan_a.precursor_mz, scan_a.retention_time / 60.0) if scan_a else "A: n/a"
         title_b = "Scan %d: %.4f m/z | RT %.2f min" % (scan_b.id, scan_b.precursor_mz, scan_b.retention_time / 60.0) if scan_b else "B: n/a"
         ax.set_title(f"A ({title_a})  vs  B ({title_b})", fontsize=10)
