@@ -290,8 +290,19 @@ class DataQualityAnalysis:
 class MultivariateAnalysis:
     """Performs multivariate statistical analyses (PCA, HCA, Heatmap)."""
 
+    TRANSFORM_OFFSET = 1.0
+
     @staticmethod
-    def perform_pca(data: pd.DataFrame, n_components: int = 2, scale: bool = True) -> Dict[str, Any]:
+    def transform_abundances(X: np.ndarray, transform: str = "none") -> np.ndarray:
+        """Apply 'none', 'log10' or 'sqrt' transformation after adding a constant offset (avoids log(0))."""
+        if transform == "log10":
+            return np.log10(X + MultivariateAnalysis.TRANSFORM_OFFSET)
+        if transform == "sqrt":
+            return np.sqrt(X + MultivariateAnalysis.TRANSFORM_OFFSET)
+        return X
+
+    @staticmethod
+    def perform_pca(data: pd.DataFrame, n_components: int = 2, scale: bool = True, transform: str = "none") -> Dict[str, Any]:
         """
         Perform Principal Component Analysis.
 
@@ -311,6 +322,7 @@ class MultivariateAnalysis:
 
             # Handle missing values
             X = np.nan_to_num(X, nan=0)
+            X = MultivariateAnalysis.transform_abundances(X, transform)
 
             if scale:
                 scaler = StandardScaler()
@@ -332,7 +344,7 @@ class MultivariateAnalysis:
             return {"success": False, "error": str(e)}
 
     @staticmethod
-    def perform_hca(data: pd.DataFrame, method: str = "ward", metric: str = "euclidean") -> Dict[str, Any]:
+    def perform_hca(data: pd.DataFrame, method: str = "ward", metric: str = "euclidean", transform: str = "none") -> Dict[str, Any]:
         """
         Perform Hierarchical Cluster Analysis.
 
@@ -347,6 +359,7 @@ class MultivariateAnalysis:
         try:
             X = data.T.values
             X = np.nan_to_num(X, nan=0)
+            X = MultivariateAnalysis.transform_abundances(X, transform)
 
             # Standardize
             scaler = StandardScaler()
@@ -364,7 +377,7 @@ class MultivariateAnalysis:
             return {"success": False, "error": str(e)}
 
     @staticmethod
-    def prepare_heatmap_data(data: pd.DataFrame, scale_rows: bool = True, cluster_rows: bool = True, cluster_cols: bool = True) -> Dict[str, Any]:
+    def prepare_heatmap_data(data: pd.DataFrame, scale_rows: bool = True, cluster_rows: bool = True, cluster_cols: bool = True, transform: str = "none") -> Dict[str, Any]:
         """
         Prepare data for heatmap visualization.
 
@@ -380,6 +393,7 @@ class MultivariateAnalysis:
         try:
             heatmap_data = data.values.copy()
             heatmap_data = np.nan_to_num(heatmap_data, nan=0)
+            heatmap_data = MultivariateAnalysis.transform_abundances(heatmap_data, transform)
 
             if scale_rows:
                 # Z-score scaling per row

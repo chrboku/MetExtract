@@ -955,6 +955,14 @@ class StatisticsTabWidget(QWidget):
         self.feature_filter_combo.currentIndexChanged.connect(self._on_feature_filter_changed)
         left_layout.addWidget(self.feature_filter_combo)
 
+        # Transformation applied before scaling/centering in PCA, HCA and heat map
+        left_layout.addWidget(QLabel("<b>Multivariate Transformation</b>"))
+        self.transform_combo = QComboBox()
+        self.transform_combo.addItems(["None", "log10(x + 1)", "sqrt(x + 1)"])
+        self.transform_combo.setToolTip("Transformation of abundances before scaling and centering (PCA, HCA, Heat Map)")
+        self.transform_combo.currentIndexChanged.connect(self._on_transform_changed)
+        left_layout.addWidget(self.transform_combo)
+
         main_splitter.addWidget(left_panel)
 
         # Right panel: Content area with splitter
@@ -1110,6 +1118,15 @@ class StatisticsTabWidget(QWidget):
         # Refresh current visualization if one is shown
         current_item = self.methods_tree.currentItem()
         if current_item:
+            self._on_method_selected(current_item, 0)
+
+    def _get_transform(self) -> str:
+        return ["none", "log10", "sqrt"][self.transform_combo.currentIndex()]
+
+    def _on_transform_changed(self, index: int):
+        """Refresh the current visualization if it is a multivariate plot."""
+        current_item = self.methods_tree.currentItem()
+        if current_item and current_item.text(0) in ("PCA (Principal Component Analysis)", "HCA (Hierarchical Cluster Analysis)", "Heat Map"):
             self._on_method_selected(current_item, 0)
 
     def _on_method_selected(self, item: QTreeWidgetItem, column: int):
@@ -1409,7 +1426,7 @@ class StatisticsTabWidget(QWidget):
         canvas = StatisticsCanvas(self, width=8, height=6)
         toolbar = NavigationToolbar(canvas, self)
 
-        pca_result = MultivariateAnalysis.perform_pca(filtered_data)
+        pca_result = MultivariateAnalysis.perform_pca(filtered_data, transform=self._get_transform())
 
         if pca_result.get("success", False):
             ax = canvas.axes
@@ -1581,7 +1598,7 @@ class StatisticsTabWidget(QWidget):
         canvas = StatisticsCanvas(self, width=10, height=6)
         toolbar = NavigationToolbar(canvas, self)
 
-        hca_result = MultivariateAnalysis.perform_hca(filtered_data)
+        hca_result = MultivariateAnalysis.perform_hca(filtered_data, transform=self._get_transform())
 
         if hca_result.get("success", False):
             ax = canvas.axes
@@ -1636,7 +1653,7 @@ class StatisticsTabWidget(QWidget):
         ordered_cols, group_segments = self._group_heatmap_columns(matched_cols, selected_groups)
         filtered_data = active_data[ordered_cols]
 
-        heatmap_result = MultivariateAnalysis.prepare_heatmap_data(filtered_data)
+        heatmap_result = MultivariateAnalysis.prepare_heatmap_data(filtered_data, transform=self._get_transform())
 
         if not heatmap_result.get("success", False):
             self._show_no_data_message(heatmap_result.get("error", "Could not compute heatmap"))

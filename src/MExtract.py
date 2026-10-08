@@ -66,6 +66,8 @@ from .mePyGuis.RegExTestDialog import RegExTestDialog
 from .mePyGuis.annotationData import AnnotationStore
 from .mePyGuis.annotationPanel import FeatureAnnotationsPanel
 from .mePyGuis.annotationBrowser import AnnotationBrowserWidget
+from .mePyGuis.fbmnTab import NETWORK_SHEET as FBMN_NETWORK_SHEET
+from .mePyGuis.fbmnTab import FBMNWidget
 from .mePyGuis.libraryCache import LibraryCache
 from .MetExtractII_Main import MetExtractVersion
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -2131,7 +2133,11 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
                 # show a dialog with a drop-down list asking the user to specify the table to load
                 options = self.experimentResults.db_con.list_tables()
-                options = [opt for opt in options if opt not in ["Parameters", "__dTypes__", "2_StatColumns_FalsePositives", "2_StatColumns_Omitted", "4_Convoluted_doublePeaks", "5_Annotated_Compounds", "5_Annotated_SumFormulas", "5_Annotated_MSMS", "0_sampleStats", "DB_info", "MSMS_info"]][::-1]
+                options = [
+                    opt
+                    for opt in options
+                    if opt not in ["Parameters", "__dTypes__", "2_StatColumns_FalsePositives", "2_StatColumns_Omitted", "4_Convoluted_doublePeaks", "5_Annotated_Compounds", "5_Annotated_SumFormulas", "5_Annotated_MSMS", "0_sampleStats", "DB_info", "MSMS_info", FBMN_NETWORK_SHEET]
+                ][::-1]
 
                 mgsBox = QtWidgets.QMessageBox(self)
                 mgsBox.setWindowTitle("Select results to load")
@@ -2483,6 +2489,8 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             self.ui.resultsExperiment_TreeWidget.clear()
             self.experimentResults.db_con = None
             delattr(self, "experimentResults")
+        if hasattr(self.ui, "fbmnWidget"):
+            self.ui.fbmnWidget.clear()
         # Clear feature map when results are closed
         self._featureMapData = []
         if hasattr(self.ui, "expFeatureMap_plot"):
@@ -3539,14 +3547,17 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         return plotItems
 
     def _syncStatisticsFeatureHighlight(self, plotItems):
-        """Highlight the currently selected Experiment results feature(s) in the Statistics tab's volcano plot(s).
+        """Highlight the currently selected Experiment results feature(s) in the Statistics tab's volcano plot(s)
+        and in the FBMN network.
 
         One-way sync (Experiment results -> Statistics): `highlight_features_by_id` never emits a signal
         back towards Experiment results, so this cannot create a cyclic update loop.
         """
+        feature_ids = [pi.id for pi in plotItems if getattr(pi, "id", None) is not None]
+        if hasattr(self.ui, "fbmnWidget"):
+            self.ui.fbmnWidget.highlight_features(feature_ids)
         if not hasattr(self.ui, "statisticsWidget"):
             return
-        feature_ids = [pi.id for pi in plotItems if getattr(pi, "id", None) is not None]
         self.ui.statisticsWidget.highlight_features_by_id(feature_ids)
 
     def _groupSampleStats(self, groupName, plotItems, definedGroups, rowsByNum):
@@ -14399,6 +14410,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                     "labeled_mz_min": lmz * (1 - ppm / 1e6) if lmz is not None else None,
                     "labeled_mz_max": lmz * (1 + ppm / 1e6) if lmz is not None else None,
                     "mode": mode,
+                    "scan_event": r.get("ScanEvent"),
                     "per_file_apex_rt": per_file_apex_rt,
                     "per_file_abund": per_file_abund,
                     "per_file_peak_rt": per_file_peak_rt,
@@ -14406,27 +14418,31 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 }
             )
 
-        # EIC peak-max cache: (file_key, num, form) -> intensity (peak apex height in that file)
+        # EIC peak-max cache: (file_key, num) -> native EIC peak height in that file; same reference as updateMSMSList_exp
         _eic_max_cache = {}
 
-        def _eic_peak_max(file_key, fr, form):
-            cache_key = (file_key, fr["num"], form)
+        def _eic_peak_max(file_key, fr):
+            cache_key = (file_key, fr["num"])
             if cache_key in _eic_max_cache:
                 return _eic_max_cache[cache_key]
-            mz_val = fr["mz"] if form == "native" else fr["lmz"]
+            mz_val = fr["mz"]
             if mz_val is None:
                 _eic_max_cache[cache_key] = None
                 return None
-            peak_rt = fr["per_file_peak_rt"][form].get(file_key)
-            if peak_rt is None:
+            n_rt = fr["per_file_peak_rt"]["native"].get(file_key)
+            l_rt = fr["per_file_peak_rt"]["labeled"].get(file_key)
+            bounds = [b for b in (n_rt, l_rt) if b is not None]
+            if bounds:
+                peak_rt = (min(b[0] for b in bounds), max(b[1] for b in bounds))
+            else:
                 peak_rt = (fr["rt_min"] * 60.0 - msms_rt_window * 60.0, fr["rt_min"] * 60.0 + msms_rt_window * 60.0)
             mzxml_file = self.loadedMZXMLs.get(file_key)
             if mzxml_file is None:
                 _eic_max_cache[cache_key] = None
                 return None
             try:
-                filter_lines = mzxml_file.getFilterLines(includeMS1=True, includeMS2=False, includePosPolarity=True, includeNegPolarity=True)
-                scan_event = None
+                scan_event = fr.get("scan_event")
+                filter_lines = None if scan_event else mzxml_file.getFilterLines(includeMS1=True, includeMS2=False, includePosPolarity=True, includeNegPolarity=True)
                 if filter_lines:
                     mode = fr.get("mode")
                     if mode and "+" in str(mode):
@@ -14467,6 +14483,8 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 fs_checked = False
                 fs_match = True
                 fs_replacement = None
+                counted_forms = set()
+                # a scan is assigned to every matching feature (as in the Experiment results MS/MS list)
                 for fr in feature_ranges:
                     if not (fr["rt_min_s"] <= ms2_scan.retention_time <= fr["rt_max_s"]):
                         continue
@@ -14488,9 +14506,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                     if not fs_match:
                         break
 
-                    apex_intensity = fr["per_file_abund"][form].get(file_key)
-                    if apex_intensity is None or apex_intensity <= 0.0:
-                        apex_intensity = _eic_peak_max(file_key, fr, form)
+                    apex_intensity = _eic_peak_max(file_key, fr)
                     if prec_intens_percent > 0.0 and apex_intensity is not None and apex_intensity > 0.0:
                         if ms2_scan.precursor_intensity < prec_intens_percent * apex_intensity:
                             continue
@@ -14509,9 +14525,10 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                         }
                     )
                     per_feature_form_count[(fr["num"], form)] += 1
-                    per_sample_stats[file_key][form] += 1
+                    if form not in counted_forms:
+                        per_sample_stats[file_key][form] += 1
+                        counted_forms.add(form)
                     per_sample_stats[file_key][f"{form}_features"].add(fr["num"])
-                    break
 
         return {
             "matched": matched,
@@ -16289,6 +16306,10 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         except Exception:
             logging.exception("Could not update MS2 spectra counts column")
 
+        if any(getattr(f, "MS2_list", None) for f in self.loadedMZXMLs.values()):
+            self.ui.fbmnWidget.setEnabled(True)
+            self._dockWidgets["fbmnTab"].setVisible(True)
+
     def showCustomFeature(self):
         self.resultsExperimentChangedNew(askForFeature=True)
 
@@ -17811,6 +17832,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             ("bracketedResultsTab", "Experiment results", self.ui.bracketedResultsTab, False),
             ("statisticsTab", "Statistics", self.ui.statisticsTab, False),
             ("annotationBrowserTab", "Annotation browser", self._createAnnotationBrowserPage(), False),
+            ("fbmnTab", "FBMN", self._createFBMNPage(), False),
         ]
 
         self._dockWidgets = {}
@@ -17829,6 +17851,9 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             dock.setVisible(defaultVisible)
             previousDock = dock
             self._dockWidgets[objName] = dock
+
+        # FBMN requires loaded raw MS/MS data (see loadAllSamples)
+        self.ui.fbmnWidget.setEnabled(False)
 
         # The old tab widget and its container are no longer needed; the pages now live in docks
         self.ui.tabWidget.setParent(None)
@@ -17921,6 +17946,220 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.ui.annotationBrowserWidget.featureSelected.connect(self._showFeatureInExperimentResults)
         self.ui.annotationBrowserWidget.filterMetabolitesRequested.connect(lambda ogroups, nums: self._addToIDFilter(ogroups=ogroups, nums=nums))
         return self.ui.annotationBrowserWidget
+
+    def _createFBMNPage(self):
+        """Build the "FBMN" (feature-based molecular networking) top-level dock page."""
+        self.ui.fbmnWidget = FBMNWidget()
+        self.ui.fbmnWidget.configure(
+            get_nodes=self._collectFBMNNodes,
+            algorithms=MSMS_SIMILARITY_ALGORITHMS,
+            get_table=self._getFBMNResultsTable,
+            get_group_abundances=self._getFBMNGroupAbundances,
+            get_saved_network=self._getFBMNSavedNetwork,
+            get_node_info=self._getFBMNNodeInfo,
+        )
+        self.ui.fbmnWidget.featureClicked.connect(self._showFeatureInExperimentResults)
+        self.ui.fbmnWidget.saveClustersRequested.connect(self._saveFBMNClusters)
+        return self.ui.fbmnWidget
+
+    def _collectFBMNNodes(self, forms, selection):
+        """Return one FBMN node dict per (visible feature pair, form) holding its most abundant
+        MS/MS spectrum that passes the experiment's MS/MS "Show options" filters, or None if
+        no experiment results / raw data are loaded."""
+        if not hasattr(self, "experimentResults") or self.experimentResults is None or self.experimentResults.db_con is None:
+            QtWidgets.QMessageBox.information(self, "FBMN", "No experiment results loaded.")
+            return None
+        if not hasattr(self, "loadedMZXMLs") or self.loadedMZXMLs is None:
+            QtWidgets.QMessageBox.information(self, "FBMN", "No raw MS/MS data loaded. Select a feature in the Experiment results to load the raw data first.")
+            return None
+
+        rows = self.experimentResults.db_con.tables[self.experimentResults.selected_table].to_dicts()
+        visible_nums = self._getVisibleFeatureNums()
+        if visible_nums is not None:
+            rows = [r for r in rows if r.get("Num") in visible_nums]
+        match_result = self._compute_msms_filtered_matches(rows)
+        if match_result is None:
+            return None
+
+        all_spectra = defaultdict(list)
+        for m in match_result["matched"]:
+            if m["form"] in forms:
+                all_spectra[(m["num"], m["form"])].append(
+                    {
+                        "scan": m["scan"],
+                        "sample": re.sub(r"\.(mzxml|mzml)$", "", os.path.basename(m["file_key"]), flags=re.IGNORECASE),
+                        "rt": m["scan"].retention_time / 60.0,
+                        "prec_intensity": m["prec_intensity"],
+                    }
+                )
+        for entries in all_spectra.values():
+            entries.sort(key=lambda e: -e["prec_intensity"])
+
+        best = {}
+        if selection == "most_abundant":
+            best = {key: entries[0] for key, entries in all_spectra.items()}
+
+        ranges_by_num = {fr["num"]: fr for fr in match_result["feature_ranges"]}
+        rows_by_num = {r.get("Num"): r for r in rows}
+        nodes = []
+        for (num, form), m in best.items():
+            fr = ranges_by_num[num]
+            other = "labeled" if form == "native" else "native"
+            nodes.append(
+                {
+                    "num": num,
+                    "form": form,
+                    "mz": fr["mz"] if form == "native" or fr["lmz"] is None else fr["lmz"],
+                    "rt": fr["rt_min"],
+                    "xn": rows_by_num.get(num, {}).get("Xn"),
+                    "ogroup": rows_by_num.get(num, {}).get("OGroup"),
+                    "polarity": fr["mode"],
+                    "abundance": fr["max_abund"][form] or fr["max_abund"][other],
+                    "scan": m["scan"],
+                    "scan_info": m,
+                    "spectra": all_spectra[(num, form)],
+                }
+            )
+        return nodes
+
+    def _getFBMNResultsTable(self):
+        if not hasattr(self, "experimentResults") or self.experimentResults is None or self.experimentResults.db_con is None:
+            return None
+        return self.experimentResults.db_con.tables.get(self.experimentResults.selected_table)
+
+    def _getFBMNNodeInfo(self, keys):
+        """Return {(Num, form): FBMN node dict without spectrum} built from the loaded results sheet
+        (same fields as `_collectFBMNNodes`), for restoring saved networks."""
+        df = self._getFBMNResultsTable()
+        if df is None or "Num" not in df.columns:
+            return {}
+
+        def _first_float(val):
+            try:
+                return float(str(val).split(";")[0]) if val is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        abund_cols = {form: [c for c in df.columns if c.endswith(suffix)] for form, suffix in (("native", "_Abundance_N"), ("labeled", "_Abundance_L"))}
+        rows_by_num = {r["Num"]: r for r in df.filter(pl.col("Num").is_in(list({num for num, _ in keys}))).to_dicts()}
+        result = {}
+        for num, form in keys:
+            r = rows_by_num.get(num)
+            if r is None:
+                continue
+            mz = _first_float(r.get("MZ"))
+            lmz = _first_float(r.get("L_MZ"))
+            max_abund = {f: max([v for v in (_first_float(r.get(c)) for c in cols) if v is not None], default=0.0) for f, cols in abund_cols.items()}
+            other = "labeled" if form == "native" else "native"
+            node_mz = mz if form == "native" or lmz is None else lmz
+            rt = _first_float(r.get("RT"))
+            if node_mz is None or rt is None:
+                continue
+            result[(num, form)] = {
+                "mz": node_mz,
+                "precursor_mz": node_mz,
+                "rt": rt,
+                "xn": r.get("Xn"),
+                "ogroup": r.get("OGroup"),
+                "polarity": str(r.get("Ionisation_Mode", "+") or "+"),
+                "abundance": max_abund[form] or max_abund[other],
+            }
+        return result
+
+    def _getFBMNGroupAbundances(self, keys):
+        """Return {(Num, form): [(group name, group color, [peak area per sample of the group, None if missing]), ...]}
+        using the _Area_N (native) / _Area_L (labeled) columns of the loaded results sheet."""
+        df = self._getFBMNResultsTable()
+        if df is None:
+            return {}
+        nums = {num for num, _ in keys}
+        rows_by_num = {r["Num"]: r for r in df.filter(pl.col("Num").is_in(list(nums))).to_dicts()}
+        groups = []
+        for group in self.getAllSampleGroups():
+            samples = [s for s in self._sampleNamesForGroup(group) if f"{s}_Area_N" in df.columns or f"{s}_Area_L" in df.columns]
+            if samples:
+                groups.append((str(group.name), str(group.color), samples))
+        result = {}
+        for num, form in keys:
+            row = rows_by_num.get(num, {})
+            suffix = "_Area_N" if form == "native" else "_Area_L"
+            entry = []
+            for name, color, samples in groups:
+                values = [self._parseAreaCellValue(row.get(s + suffix)) for s in samples]
+                entry.append((name, color, values))
+            result[(num, form)] = entry
+        return result
+
+    def _saveFBMNClusters(self, assignments):
+        """Write the FBMN cluster ids ({Num: label}) to the 'FBMN_cluster' column of the loaded results sheet
+        and the network (parameters, clusters with nodes and edges as JSON) to the FBMN network sheet."""
+        if not hasattr(self, "experimentResults") or self.experimentResults is None or self.experimentResults.db_con is None:
+            QtWidgets.QMessageBox.information(self, "FBMN", "No experiment results loaded.")
+            return
+        db_con = self.experimentResults.db_con
+        selected_table = self.experimentResults.selected_table
+        df = db_con.tables[selected_table]
+        mapping = pl.DataFrame(
+            {
+                "Num": pl.Series(list(assignments.keys()), dtype=df.schema["Num"]),
+                "FBMN_cluster": pl.Series(list(assignments.values()), dtype=pl.Utf8),
+            }
+        )
+        if "FBMN_cluster" in df.columns:
+            df = df.drop("FBMN_cluster")
+        network_df = pl.DataFrame(
+            self.ui.fbmnWidget.network_rows({"results_table": selected_table}),
+            schema={"Cluster": pl.Utf8, "Part": pl.Int64, "Nodes": pl.Int64, "Edges": pl.Int64, "JSON": pl.Utf8},
+        )
+
+        progress = QtWidgets.QProgressDialog("MetExtract II is saving the FBMN network...", "", 0, 0, self)
+        progress.setWindowTitle("Saving FBMN network")
+        progress.setCancelButton(None)
+        progress.setWindowModality(QtCore.Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+        QtWidgets.QApplication.processEvents()
+        try:
+            db_con.set_table(selected_table, df.join(mapping, on="Num", how="left"))
+            db_con.set_table(FBMN_NETWORK_SHEET, network_df)
+            db_con.commit()
+        except Exception as ex:
+            logging.exception("Failed to save FBMN network to results file")
+            progress.close()
+            QtWidgets.QMessageBox.warning(self, "FBMN", f"Could not save the FBMN network: {ex}")
+            return
+        progress.close()
+        QtWidgets.QMessageBox.information(
+            self,
+            "FBMN",
+            f"Saved the FBMN clusters of {len(assignments)} feature pairs to column 'FBMN_cluster' of sheet '{selected_table}' and the network to sheet '{FBMN_NETWORK_SHEET}'.",
+        )
+
+    def _getFBMNSavedNetwork(self):
+        """Return the rows of the FBMN network sheet of the results file, or None if there is none."""
+        if not hasattr(self, "experimentResults") or self.experimentResults is None or self.experimentResults.db_con is None:
+            QtWidgets.QMessageBox.information(self, "FBMN", "No experiment results loaded.")
+            return None
+        df = self.experimentResults.db_con.tables.get(FBMN_NETWORK_SHEET)
+        if df is None or df.height == 0:
+            QtWidgets.QMessageBox.information(self, "FBMN", f"The results file contains no saved network (sheet '{FBMN_NETWORK_SHEET}'). Use 'Save network to results file' first.")
+            return None
+        rows = df.to_dicts()
+        param_text = "".join(str(r.get("JSON") or "") for r in sorted((r for r in rows if r.get("Cluster") == "parameters"), key=lambda r: r.get("Part") or 0))
+        try:
+            saved_table = json.loads(param_text).get("results_table")
+        except (ValueError, AttributeError):
+            saved_table = None
+        selected_table = self.experimentResults.selected_table
+        if saved_table and saved_table != selected_table:
+            answer = QtWidgets.QMessageBox.question(
+                self,
+                "FBMN",
+                f"The saved network was generated from the results sheet '{saved_table}', but '{selected_table}' is loaded. Restore it anyway?",
+            )
+            if answer != QtWidgets.QMessageBox.Yes:
+                return None
+        return rows
 
     def _addFeatureAnnotationsTab(self):
         """Add the "Feature annotations" panel (MS/MS-, database- and sum-formula hits of
@@ -18119,7 +18358,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         """Add a "View" menu that lets the user re-open any closed/hidden pane."""
         self.ui.menuView = QtWidgets.QMenu(self.ui.menuBar)
         self.ui.menuView.setTitle("View")
-        for objName in ("welcomeTab", "inputTab", "pickingTab", "resultsTab", "bracketedResultsTab", "statisticsTab", "annotationBrowserTab"):
+        for objName in ("welcomeTab", "inputTab", "pickingTab", "resultsTab", "bracketedResultsTab", "statisticsTab", "annotationBrowserTab", "fbmnTab"):
             action = self._dockWidgets[objName].toggleViewAction()
             self.ui.menuView.addAction(action)
         # Insert "View" right after "File" (before "Tools")
