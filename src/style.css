@@ -114,7 +114,21 @@ QComboBox:focus {
 }
 
 QComboBox::drop-down {
-    border: none;
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    width: 18px;
+    border-left: 1px solid #c0c4cc;
+    background-color: #e8eaed;
+    border-radius: 0 2px 2px 0;
+}
+
+QComboBox::down-arrow {
+    width: 10px;
+    height: 10px;
+    background-color: #32609E;
+}
+QComboBox::down-arrow:disabled {
+    background-color: #e8eaed;
 }
 
 QComboBox QAbstractItemView {
@@ -123,6 +137,11 @@ QComboBox QAbstractItemView {
     selection-background-color: #e8f0fe;
     selection-color: #32609E;
     outline: none;
+}
+
+QComboBox QAbstractItemView::item {
+    padding: 2px 6px;
+    min-height: 18px;
 }
 
 /* -------------------------------------------------------
@@ -141,6 +160,22 @@ QPushButton {
 QPushButton:disabled {
     color: #9aa0a6;
     background-color: #f1f3f4;
+}
+
+/* Halved-height buttons (compact panels) */
+QPushButton#pushButton_showOptions1,
+QPushButton#pushButton_showOptions2,
+QPushButton#pushButton_showOptions3,
+QPushButton#showCustomFeature_pushButton {
+    min-height: 10px;
+    padding: 2px 16px;
+}
+
+/* Every button inside the "Experiment results" panel (incl. its nested
+   dock panels) matches the compact "Show options" button height */
+#bracketedResultsTab QPushButton {
+    min-height: 10px;
+    padding: 2px 16px;
 }
 
 /* -------------------------------------------------------
@@ -211,6 +246,76 @@ QTabBar::tab:left:disabled {
     color: #b0b4b8;
     background-color: #f8f9fa;
     border-color: #e8eaed;
+}
+
+/* -------------------------------------------------------
+   Dockable panes (VS Code-like editor groups)
+   Each "page" (Input, Process, Sample results, Experiment results,
+   Statistics) is a QDockWidget; when several are tabified together
+   their tab bar re-uses the QTabBar rules above, styled here to look
+   like VS Code's editor tab strip.
+------------------------------------------------------- */
+QMainWindow::separator {
+    background-color: #dadce0;
+    width: 4px;
+    height: 4px;
+}
+
+QMainWindow::separator:hover {
+    background-color: #1a73e8;
+}
+
+QDockWidget {
+    color: #202124;
+    font-weight: 500;
+}
+
+QDockWidget::title {
+    background-color: #e8eaed;
+    border-bottom: 1px solid #dadce0;
+    padding: 4px 6px;
+    text-align: left;
+}
+
+QDockWidget::close-button,
+QDockWidget::float-button {
+    background-color: #dadce0;
+    border: 1px solid #c4c7ca;
+    border-radius: 3px;
+    padding: 3px;
+}
+
+QDockWidget::close-button:hover,
+QDockWidget::float-button:hover {
+    background-color: #1a73e8;
+    border-color: #1a73e8;
+}
+
+/* Tab bar used by tabified dock widgets (the "editor group" tab strip) */
+QDockWidget QTabBar::tab,
+QMainWindow QTabBar::tab {
+    background-color: #f1f3f4;
+    border: 1px solid #dadce0;
+    border-bottom: none;
+    padding: 5px 12px;
+    color: #5f6368;
+    margin-right: 2px;
+    border-top-left-radius: 3px;
+    border-top-right-radius: 3px;
+}
+
+QDockWidget QTabBar::tab:selected,
+QMainWindow QTabBar::tab:selected {
+    background-color: #ffffff;
+    color: #1a73e8;
+    border-bottom: 2px solid #1a73e8;
+    font-weight: 600;
+}
+
+QDockWidget QTabBar::tab:hover:!selected,
+QMainWindow QTabBar::tab:hover:!selected {
+    background-color: #e8eaed;
+    color: #202124;
 }
 
 /* -------------------------------------------------------
@@ -419,6 +524,42 @@ QCheckBox::indicator:unchecked:hover {
 }
 
 /* -------------------------------------------------------
+   Radio buttons
+------------------------------------------------------- */
+QRadioButton {
+    spacing: 5px;
+    color: #202124;
+    background-color: transparent;
+}
+
+QRadioButton::indicator {
+    width: 14px;
+    height: 14px;
+    border: 1px solid #adb5bd;
+    border-radius: 7px;
+    background-color: #ffffff;
+    image: none;
+}
+
+QRadioButton::indicator:unchecked {
+    background-color: #ffffff;
+    border: 1px solid #adb5bd;
+    image: none;
+}
+
+QRadioButton::indicator:checked {
+    background-color: #ffffff;
+    border: 5px solid #32609E;
+    image: none;
+}
+
+QRadioButton::indicator:hover,
+QRadioButton::indicator:unchecked:hover {
+    border-color: #32609E;
+    image: none;
+}
+
+/* -------------------------------------------------------
    Checkable group box indicator (same visual as QCheckBox)
 ------------------------------------------------------- */
 QGroupBox::indicator {
@@ -458,11 +599,20 @@ QProgressBar {
     text-align: center;
     color: #202124;
     font-size: 11px;
+    min-height: 22px;
 }
 
 QProgressBar::chunk {
     background-color: #32609E;
     border-radius: 2px;
+}
+
+/* -------------------------------------------------------
+   QListView
+------------------------------------------------------- */
+
+QListView {
+    background-color: #ffffff;
 }
 
 /* -------------------------------------------------------
@@ -574,10 +724,20 @@ QRadioButton:disabled {
 QRadioButton::indicator:disabled {
     border-color: #e8eaed;
     background-color: #f1f3f4;
+    border-radius: 7px;
+}
+
+QRadioButton::indicator:checked:disabled {
+    background-color: #f1f3f4;
+    border: 5px solid #c5cdd6;
 }
 
 QTabBar::tab:disabled {
     color: #b0b4b8;
     background-color: #f8f9fa;
     border-color: #e8eaed;
+}
+
+QListView:disabled {
+    background-color: #f8f9fa;
 }

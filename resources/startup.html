@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>MetExtract II - Welcome</title>
+<style>
+    :root {
+        --border-red: #e05a5a;
+        --border-yellow: #e0b93d;
+        --border-green: #4caf7d;
+        --border-blue: #4a8fe0;
+    }
+    * { box-sizing: border-box; }
+    body {
+        margin: 0;
+        padding: 48px 32px 64px 32px;
+        background: #ffffff;
+        color: #1a1a1a;
+        font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+    .container {
+        max-width: 1000px;
+        margin: 0 auto;
+        text-align: center;
+    }
+    .logo {
+        max-width: 160px;
+        margin-bottom: 12px;
+    }
+    .badge {
+        display: inline-block;
+        padding: 6px 16px;
+        border-radius: 999px;
+        background: #f2f2f2;
+        color: #555;
+        font-size: 13px;
+        margin-bottom: 20px;
+    }
+    h1.title {
+        font-size: 56px;
+        font-weight: 800;
+        margin: 0 0 8px 0;
+        letter-spacing: -1px;
+    }
+    .version {
+        font-size: 16px;
+        color: #777;
+        margin-bottom: 18px;
+    }
+    p.subtitle {
+        font-size: 16px;
+        line-height: 1.6;
+        color: #555;
+        max-width: 720px;
+        margin: 0 auto 12px auto;
+    }
+    .reference {
+        font-size: 14px;
+        color: #555;
+        margin-bottom: 36px;
+    }
+    .reference a {
+        color: #2b6cb0;
+        text-decoration: none;
+        font-weight: 600;
+    }
+    .reference a:hover {
+        text-decoration: underline;
+    }
+    .cards {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 20px;
+        margin-top: 12px;
+        text-align: left;
+    }
+    .card {
+        border-top: 3px solid var(--border-red);
+        background: #fafafa;
+        border-radius: 6px;
+        padding: 18px 18px 16px 18px;
+    }
+    .card .icon {
+        font-size: 22px;
+        margin-bottom: 10px;
+    }
+    .card h3 {
+        font-size: 16px;
+        margin: 0 0 8px 0;
+    }
+    .card p {
+        font-size: 13px;
+        line-height: 1.5;
+        color: #666;
+        margin: 0;
+    }
+    .card p a {
+        color: #2b6cb0;
+        text-decoration: none;
+    }
+    .card p a:hover {
+        text-decoration: underline;
+    }
+    .card:nth-child(3n+1) { border-top-color: var(--border-red); }
+    .card:nth-child(3n+2) { border-top-color: var(--border-yellow); }
+    .card:nth-child(3n+3) { border-top-color: var(--border-green); }
+</style>
+</head>
+<body>
+<div class="container">
+    <img class="logo" src="logo.png" alt="MetExtract II logo">
+    <h1 class="title">MetExtract II</h1>
+    <div class="version">Version {{VERSION}}</div>
+    <p class="subtitle">
+        A comprehensive metabolite extraction and analysis tool for stable isotope labeled, untargeted metabolomics.
+    </p>
+    <p class="reference">
+        Please cite:
+        <a href="https://dx.doi.org/10.1021/acs.analchem.7b02518" target="_blank">
+            Bueschl et al. (2017) - MetExtract II: A software suite for stable isotope-assisted untargeted metabolomics, Anal. Chem. 89(17):9518-9526
+        </a>
+        <br>
+        When using Feature-Based Molecular Networking (FBMN), please also cite:
+        <a href="https://doi.org/10.1038/s41592-020-0933-6" target="_blank">
+            Nothias, LF., Petras, D., Schmid, R. <i>et al.</i> Feature-based molecular networking in the GNPS analysis environment. Nat Methods 17, 905&ndash;908 (2020)
+        </a>
+    </p>
+
+    <div class="cards">
+        <div class="card">
+            <div class="icon">📁</div>
+            <h3>Working directory</h3>
+            <p>When you start a new experiment, please <b>change the working directory</b> to your experimental folder via the menu ("Tools" &rarr; "Set working directory").</p>
+        </div>
+        <div class="card">
+            <div class="icon">💾</div>
+            <h3>Copy your resources</h3>
+            <p>Please consider <b>copying</b> any databases or other resources to your working directory (e.g., the DB folder).</p>
+        </div>
+        <div class="card">
+            <div class="icon">🖱️</div>
+            <h3>Quick value changes</h3>
+            <p>To quickly change the values of drop-down and integer/float spinner controls, <b>hold the CTRL key and use the mouse-wheel</b>.</p>
+        </div>
+        <div class="card">
+            <div class="icon">📥</div>
+            <h3>mzML import errors</h3>
+            <p>If importing mzML files results in an error of missing files, download the correct obo-file from
+                <a href="https://bioportal.bioontology.org/ontologies/MS" target="_blank">bioportal.bioontology.org/ontologies/MS</a>
+                and save it to the folder named in the error message. You can also open this page via "Tools" &rarr; "Download OBO files".</p>
+        </div>
+        <div class="card">
+            <div class="icon">🔍</div>
+            <h3>MS/MS filter strings</h3>
+            <p>In the experiment-results MS/MS tab you can <b>filter spectra by their filter string</b> (cvParam MS:1000512) using a regular expression, e.g. <code>(FTMS|ITMS).*</code>. Leave it empty to show all spectra.</p>
+        </div>
+        <div class="card">
+            <div class="icon">📄</div>
+            <h3>Database template</h3>
+            <p>To generate a template for a database, select <b>"Download Database Template"</b> from the "Tools" menu.</p>
+        </div>
+        <div class="card">
+            <div class="icon">📊</div>
+            <h3>Editable results</h3>
+            <p>Results XLSX files can be modified. Additional columns (e.g., for user-based grouping) may be used as a grouping factor in the <b>Experiment results</b> (isotopic pattern clustering, statistically significant metabolites, etc.).</p>
+        </div>
+        <div class="card">
+            <div class="icon">🌋</div>
+            <h3>Volcano plot selection</h3>
+            <p>Use <b>CTRL + "draw a rectangle"</b> to select significantly different features in volcano plots. These are then automatically selected in the feature list in the Experiment results.</p>
+        </div>
+        <div class="card">
+            <div class="icon">🗂️</div>
+            <h3>Panel layouts</h3>
+            <p>Save your <b>panel layout</b> using the File menu and conveniently restore a previous layout from there as well.</p>
+        </div>
+    </div>
+</div>
+</body>
+</html>

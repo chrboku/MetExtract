@@ -3,6 +3,66 @@ import os
 import pandas as pd
 
 
+def writeIQXInclusionList(rows, toFile):
+    """Write an IQ-X style inclusion list (comma-separated CSV).
+
+    *rows* is a list of dicts with keys: compound, mz, tstart, tstop, intensityThreshold.
+    """
+    with open(toFile, "w", newline="") as csvfile:
+        writer = csv.writer(csvfile, delimiter=",", lineterminator="\n")
+        writer.writerow(["Compound", "m/z", "t start (min)", "t stop (min)", "Intensity Threshold"])
+        for r in rows:
+            writer.writerow(
+                [
+                    r["compound"],
+                    "%.5f" % r["mz"],
+                    "%.3f" % r["tstart"],
+                    "%.3f" % r["tstop"],
+                    r["intensityThreshold"],
+                ]
+            )
+
+
+def writeQExactiveInclusionList(rows, toFile):
+    """Write a QExactive style inclusion list (comma-separated CSV).
+
+    *rows* is a list of dicts with keys: mz, polarity, tstart, tstop.
+    All other columns are left empty.
+    """
+    headers = [
+        "Mass [m/z]",
+        "Formula [M]",
+        "Formula type",
+        "Species",
+        "CS [z]",
+        "Polarity",
+        "Start [min]",
+        "End [min]",
+        "(N)CE",
+        "MSXID",
+        "Comment",
+    ]
+    data = []
+    for r in rows:
+        data.append(
+            {
+                "Mass [m/z]": "%.5f" % r["mz"],
+                "Formula [M]": "",
+                "Formula type": "",
+                "Species": "",
+                "CS [z]": "",
+                "Polarity": r["polarity"],
+                "Start [min]": "%.3f" % r["tstart"],
+                "End [min]": "%.3f" % r["tstop"],
+                "(N)CE": "",
+                "MSXID": "",
+                "Comment": "",
+            }
+        )
+    df = pd.DataFrame(data, columns=headers)
+    df.to_csv(toFile, index=False, sep=",", lineterminator="\n")
+
+
 def writeInclusionList(mzs, rtStarts, rtEnds, pols, toFile, comments=None):
     with open(toFile, "w") as tsvfile:
         writer = csv.writer(tsvfile, delimiter=",", lineterminator="\n")
@@ -123,4 +183,5 @@ def genInclusionForFolder(processPath, rtPlusMinusMin=0.2):
 processPath = r"N:\iBAM\Christina\Inclusions lists"
 rtPlusMinusMin = 0.2
 
-genInclusionForFolder(processPath, rtPlusMinusMin)
+if __name__ == "__main__":
+    genInclusionForFolder(processPath, rtPlusMinusMin)

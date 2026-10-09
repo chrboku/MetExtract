@@ -270,6 +270,7 @@ class OptimizeMSMSTargetList:
             if bestOffspringScore > score and bestOffspring is not None:
                 mat = bestOffspring
 
+            fig.tight_layout()
             fig.canvas.draw()
 
         # print("Finished.. improvement best score (%.2E) to start score (%.2E) of %.1f%%)"%(scoreD, startScore, (score/startScore-1.)*100.))

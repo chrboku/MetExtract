@@ -147,6 +147,7 @@ def drawCanvas(plt, ylim=None, xlim=None):
             else:
                 ax.set_xlim(xlim[0], xlim[1])
 
+    plt.fig.tight_layout()
     plt.canvas.draw()
 
 
