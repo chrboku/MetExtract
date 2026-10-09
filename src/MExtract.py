@@ -11225,10 +11225,15 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             mz_arr, int_arr, _ = peaks
             xlim = ax.get_xlim()
             ylim = ax.get_ylim()
+            if getattr(ax, "_msms_sqrt", False):
+                ylim = tuple(self._signed_sqrt(v) for v in ylim)
+                my = self._signed_sqrt(my)
             x_range = xlim[1] - xlim[0] or 1.0
             y_range = ylim[1] - ylim[0] or 1.0
             best_idx, best_dist = 0, float("inf")
             for i, (mz, iv) in enumerate(zip(mz_arr, int_arr)):
+                if getattr(ax, "_msms_sqrt", False):
+                    iv = self._signed_sqrt(iv)
                 dx = abs(float(mz) - mx) / x_range
                 dy = abs(float(iv) - my) / y_range
                 d = (dx**2 + dy**2) ** 0.5
@@ -12374,8 +12379,27 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         per_group_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Interactive)
         per_group_table.resizeColumnsToContents()
 
+    @staticmethod
+    def _signed_sqrt(v):
+        return float(np.sign(v) * np.sqrt(abs(v)))
+
+    @staticmethod
+    def _apply_msms_sqrt_axis(ax, max_val, mirror):
+        """Switch the y axis of an MS/MS axes to a (signed) square-root scale with fixed ticks."""
+        ax.set_yscale("function", functions=(lambda v: np.sign(v) * np.sqrt(np.abs(v)), lambda v: np.sign(v) * np.square(v)))
+        fractions = [0.0, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0]
+        ticks = [max_val * f for f in fractions]
+        if mirror:
+            ticks = [-t for t in reversed(ticks[1:])] + ticks
+        ax.set_yticks(ticks)
+        ax.set_yticklabels(["%.3g" % abs(t) for t in ticks])
+        ax.minorticks_off()
+        top = max_val * 1.1
+        ax.set_ylim(-top if mirror else 0, top)
+
     def plotSelectedMSMSSpectra_exp(self):
         """Plot selected MSMS spectra from experimental results panel"""
+        use_sqrt = self.ui.checkBox_msms_sqrt_exp.isChecked()
         selected_rows = sorted(set(item.row() for item in self.ui.msms_SpectraList_exp.selectedItems()))
         self._update_msms_selected_similarity_exp(selected_rows)
 
@@ -12435,7 +12459,10 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                         ax.text(mz_val, intensity_val * 1.01, "%.4f" % mz_val, fontsize=9, ha="center", va="bottom", rotation=0, color=label_color, alpha=0.6)
 
             ax.set_xlabel("m/z", fontsize=12)
-            ax.set_ylabel("Intensity", fontsize=12)
+            ax.set_ylabel("Intensity (square-root scale)" if use_sqrt else "Intensity", fontsize=12)
+            if use_sqrt and len(scan.mz_list) > 0:
+                self._apply_msms_sqrt_axis(ax, float(max(scan.intensity_list)), False)
+                ax._msms_sqrt = True
             ax.set_title("Scan %d: %.4f m/z | RT %.2f min | I %.3g" % (scan.id, scan.precursor_mz, scan.retention_time / 60.0, scan.precursor_intensity), fontsize=11)
             ax.tick_params(labelsize=12)
             ax.grid(True, alpha=0.3)
@@ -12498,8 +12525,13 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
         ax.axhline(0, color="black", linewidth=0.8)
         ax.set_xlabel("m/z", fontsize=12)
-        ax.set_ylabel("Relative intensity (%) (A up / B down)", fontsize=12)
-        ax.set_ylim(-110, 110)
+        if self.ui.checkBox_msms_sqrt_exp.isChecked():
+            ax.set_ylabel("Relative intensity (%, square-root scale) (A up / B down)", fontsize=12)
+            self._apply_msms_sqrt_axis(ax, 100.0, True)
+            ax._msms_sqrt = True
+        else:
+            ax.set_ylabel("Relative intensity (%) (A up / B down)", fontsize=12)
+            ax.set_ylim(-110, 110)
         title_a = "Scan %d: %.4f m/z | RT %.2f min" % (scan_a.id, scan_a.precursor_mz, scan_a.retention_time / 60.0) if scan_a else "A: n/a"
         title_b = "Scan %d: %.4f m/z | RT %.2f min" % (scan_b.id, scan_b.precursor_mz, scan_b.retention_time / 60.0) if scan_b else "B: n/a"
         ax.set_title(f"A ({title_a})  vs  B ({title_b})", fontsize=10)
@@ -19366,6 +19398,9 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         _msmsControlsContent.setLayout(self.ui.msms_controls_exp)
         _msmsControlsSection = self._makeCollapsibleSection(_msmsControlsContent, "buttons")
         self.ui.verticalLayout_msms_exp.insertWidget(1, _msmsControlsSection)
+        self.ui.checkBox_msms_sqrt_exp = QtWidgets.QCheckBox("Square-root intensity axis")
+        self.ui.checkBox_msms_sqrt_exp.toggled.connect(lambda _checked: self.plotSelectedMSMSSpectra_exp())
+        self.ui.verticalLayout_msms_exp.insertWidget(2, self.ui.checkBox_msms_sqrt_exp)
         self.ui.btn_msms_similarity_native.clicked.connect(lambda: self._show_msms_similarity_dialog("native"))
         self.ui.btn_msms_similarity_labeled.clicked.connect(lambda: self._show_msms_similarity_dialog("labeled"))
         self.ui.btn_msms_overview.clicked.connect(self._show_msms_overview)
