@@ -4010,6 +4010,7 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         # Show progress dialog
         pw = ProgressWrapper(1, parent=self, showIndProgress=False)
         pw.show()
+        pw.getCallingFunction()("text")("Assigning MS/MS spectra to experiment results")
 
         try:
             ppm = self.ui.doubleSpinBox_resultsExperiment_EICppm.value()

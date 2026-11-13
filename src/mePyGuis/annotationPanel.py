@@ -17,6 +17,9 @@ from .annotationData import AnnotationStore, get_structure_smiles
 from .structureRenderer import render_structure_pixmap
 from ..isotopeScoring import ISOTOPOLOG_NAMES
 
+# Header background per nesting level (type, database/library, individual annotation): progressively fainter blue
+_LEVEL_COLORS = ["#a9c9ec", "#c9ddf4", "#e4eefa"]
+
 
 class _AnnotationCard(QtWidgets.QWidget):
     """A single collapsible entry. By default (`lazy=True`) the body (metadata grid + structure
@@ -24,7 +27,7 @@ class _AnnotationCard(QtWidgets.QWidget):
     build it immediately (used for the type/database grouping levels, so filtering still works
     without the user having to expand every section first)."""
 
-    def __init__(self, title, build_body_fn, parent=None, lazy=True, start_expanded=False):
+    def __init__(self, title, build_body_fn, parent=None, lazy=True, start_expanded=False, level=2):
         super().__init__(parent)
         self._build_body_fn = build_body_fn
         self._body_built = False
@@ -35,7 +38,7 @@ class _AnnotationCard(QtWidgets.QWidget):
 
         self.toggle_btn = QtWidgets.QPushButton()
         self.toggle_btn.setCheckable(True)
-        self.toggle_btn.setStyleSheet("text-align: left; padding: 4px 8px; font-weight: bold;")
+        self.toggle_btn.setStyleSheet(f"text-align: left; padding: 4px 8px; font-weight: bold; color: black; background-color: {_LEVEL_COLORS[min(level, len(_LEVEL_COLORS) - 1)]};")
         layout.addWidget(self.toggle_btn)
 
         self.body = QtWidgets.QWidget()
@@ -185,17 +188,35 @@ def _add_mirror_plot(layout, exp_scan, lib_spectrum):
 
     fig = Figure(figsize=(4.5, 2.8), dpi=80, facecolor="white")
     canvas = FigureCanvas(fig)
-    ax = fig.add_subplot(111)
     exp_norm = exp_intens / exp_intens.max() * 100.0 if exp_intens.max() > 0 else exp_intens
     lib_norm = lib_intens / lib_intens.max() * 100.0 if lib_intens.max() > 0 else lib_intens
-    ax.vlines(exp_mz, 0, exp_norm, colors="dodgerblue", linewidth=1.2, label="Experimental")
-    ax.vlines(lib_mz, 0, -lib_norm, colors="firebrick", linewidth=1.2, label="Library")
-    ax.axhline(0, color="black", linewidth=0.8)
-    ax.set_xlabel("m/z", fontsize=5)
-    ax.set_ylabel("Rel. intensity (%)", fontsize=5)
-    ax.tick_params(axis="both", labelsize=5)
-    ax.legend(loc="upper right", fontsize=4)
-    fig.tight_layout()
+    sqrt_ticks_pct = [0, 5, 10, 25, 50, 75, 100]
+
+    def draw(sqrt_axis):
+        fig.clear()
+        ax = fig.add_subplot(111)
+        exp_y = np.sqrt(np.clip(exp_norm, 0.0, None)) if sqrt_axis else exp_norm
+        lib_y = np.sqrt(np.clip(lib_norm, 0.0, None)) if sqrt_axis else lib_norm
+        ax.vlines(exp_mz, 0, exp_y, colors="dodgerblue", linewidth=1.2, label="Experimental")
+        ax.vlines(lib_mz, 0, -lib_y, colors="firebrick", linewidth=1.2, label="Library")
+        ax.axhline(0, color="black", linewidth=0.8)
+        if sqrt_axis:
+            ticks = [math.sqrt(p) for p in sqrt_ticks_pct]
+            ticks = [-t for t in reversed(ticks[1:])] + ticks
+            ax.set_yticks(ticks)
+            ax.set_yticklabels([f"{abs(t) ** 2:g}" for t in ticks])
+            ax.set_ylim(-11.0, 11.0)
+        ax.set_xlabel("m/z", fontsize=5)
+        ax.set_ylabel("Rel. intensity (%, square root scale)" if sqrt_axis else "Rel. intensity (%)", fontsize=5)
+        ax.tick_params(axis="both", labelsize=5)
+        ax.legend(loc="upper right", fontsize=4)
+        fig.tight_layout()
+        canvas.draw_idle()
+
+    sqrt_check = QtWidgets.QCheckBox("Square-root intensity axis")
+    sqrt_check.toggled.connect(draw)
+    layout.addWidget(sqrt_check)
+    draw(False)
     canvas.setMinimumHeight(220)
     layout.addWidget(canvas)
     return canvas
@@ -325,10 +346,10 @@ class FeatureAnnotationsPanel(QtWidgets.QWidget):
                         inner_layout.addWidget(card)
                         self._section_cards.append((type_title, self._filter_text_for_row(type_title, row), card))
 
-                group_card = _AnnotationCard(f"{group_name} ({len(group_rows)})", build_group_body, lazy=False, start_expanded=True)
+                group_card = _AnnotationCard(f"{group_name} ({len(group_rows)})", build_group_body, lazy=False, start_expanded=True, level=1)
                 layout.addWidget(group_card)
 
-        type_card = _AnnotationCard(f"{type_title} ({len(rows)})", build_type_body, lazy=False, start_expanded=True)
+        type_card = _AnnotationCard(f"{type_title} ({len(rows)})", build_type_body, lazy=False, start_expanded=True, level=0)
         self.content_layout.addWidget(type_card)
         return True
 
