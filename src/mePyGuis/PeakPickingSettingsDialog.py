@@ -103,7 +103,7 @@ class PeakPickingSettingsDialog(QtWidgets.QDialog):
     # Signal emitted when the user accepts the dialog
     settingsAccepted = QtCore.Signal(dict)
 
-    def __init__(self, parent=None, current_settings: dict | None = None, sample_files=None, scan_events=None):
+    def __init__(self, parent=None, current_settings: dict | None = None, sample_files=None, scan_events=None, initial_eic_rows=None):
         super().__init__(parent)
         self.setWindowTitle("Chromatographic Peak Picking Settings")
         self.setMinimumSize(900, 650)
@@ -118,9 +118,13 @@ class PeakPickingSettingsDialog(QtWidgets.QDialog):
         self._sample_files = sample_files or []
         # scan_events: {"+ ": [filter_line, ...], "-": [filter_line, ...]}
         self._scan_events = scan_events or {}
+        # Saved EIC rows to restore on re-open: list of (file_idx, filter_idx, mz, ppm)
+        self._initial_eic_rows = initial_eic_rows or []
 
         self._build_ui()
         self._load_settings(current_settings)
+        if self._initial_eic_rows:
+            self._restore_eic_rows(self._initial_eic_rows)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -151,12 +155,16 @@ class PeakPickingSettingsDialog(QtWidgets.QDialog):
 
         splitter.addWidget(left_widget)
 
-        # ── RIGHT PANEL: EIC definitions (compact) + plot ───────────────
+        # ── RIGHT PANEL: vertical splitter with EIC definitions + plot ──
         right_widget = QtWidgets.QWidget()
-        right_layout = QtWidgets.QVBoxLayout(right_widget)
-        right_layout.setContentsMargins(4, 0, 0, 0)
+        right_outer = QtWidgets.QVBoxLayout(right_widget)
+        right_outer.setContentsMargins(4, 0, 0, 0)
+        right_outer.setSpacing(0)
 
-        # EIC definitions group (compact)
+        right_vsplit = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        right_outer.addWidget(right_vsplit, stretch=1)
+
+        # ── Top half of splitter: EIC definitions ──────────────────────
         eic_group = QtWidgets.QGroupBox("EIC Definitions (for preview)")
         eic_layout = QtWidgets.QVBoxLayout(eic_group)
         eic_layout.setSpacing(4)
@@ -164,7 +172,6 @@ class PeakPickingSettingsDialog(QtWidgets.QDialog):
         self.eicTable = QtWidgets.QTableWidget(0, 4)
         self.eicTable.setHorizontalHeaderLabels(["File", "Filter Line", "m/z", "ppm"])
         self.eicTable.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.eicTable.setMaximumHeight(110)
         self.eicTable.setToolTip("Define EICs to preview peak picking. Each row specifies a loaded file, the MS1 filter line (scan event), m/z value, and ppm tolerance.")
         hdr = self.eicTable.horizontalHeader()
         hdr.setSectionResizeMode(QtWidgets.QHeaderView.Interactive)
@@ -177,15 +184,30 @@ class PeakPickingSettingsDialog(QtWidgets.QDialog):
         self.btnAddEic.setToolTip("Add a new EIC definition row")
         self.btnRemoveEic = QtWidgets.QPushButton("Remove Selected")
         self.btnRemoveEic.setToolTip("Remove selected EIC definition(s)")
+        self.btnDuplicateEic = QtWidgets.QPushButton("Duplicate Selected")
+        self.btnDuplicateEic.setToolTip("Duplicate the selected EIC definition row")
+        self.btnDuplicateEic1Da = QtWidgets.QPushButton("Duplicate +1 Da")
+        self.btnDuplicateEic1Da.setToolTip("Duplicate the selected EIC and shift m/z by +1.00335484 Da (one \u00b9\u00b3C isotope step)")
+        self.btnDuplicateEicHalfDa = QtWidgets.QPushButton("Duplicate +\u00bd Da")
+        self.btnDuplicateEicHalfDa.setToolTip("Duplicate the selected EIC and shift m/z by +0.50167742 Da (half \u00b9\u00b3C isotope step for doubly-charged ions)")
         self.btnPickEic = QtWidgets.QPushButton("Pick Peaks")
         self.btnPickEic.setToolTip("Run peak picking on defined EICs and show results below")
         eic_btn_layout.addWidget(self.btnAddEic)
         eic_btn_layout.addWidget(self.btnRemoveEic)
+        eic_btn_layout.addWidget(self.btnDuplicateEic)
+        eic_btn_layout.addWidget(self.btnDuplicateEic1Da)
+        eic_btn_layout.addWidget(self.btnDuplicateEicHalfDa)
         eic_btn_layout.addStretch()
         eic_btn_layout.addWidget(self.btnPickEic)
         eic_layout.addLayout(eic_btn_layout)
 
-        right_layout.addWidget(eic_group, stretch=0)
+        right_vsplit.addWidget(eic_group)
+
+        # ── Bottom half of splitter: progress bar + plot ───────────────
+        plot_outer = QtWidgets.QWidget()
+        plot_outer_layout = QtWidgets.QVBoxLayout(plot_outer)
+        plot_outer_layout.setContentsMargins(0, 0, 0, 0)
+        plot_outer_layout.setSpacing(2)
 
         # Progress bar (hidden until peak picking runs)
         self._progress_bar = QtWidgets.QProgressBar()
@@ -194,10 +216,15 @@ class PeakPickingSettingsDialog(QtWidgets.QDialog):
         self._progress_bar.setTextVisible(True)
         self._progress_bar.setFixedHeight(16)
         self._progress_bar.hide()
-        right_layout.addWidget(self._progress_bar, stretch=0)
+        plot_outer_layout.addWidget(self._progress_bar, stretch=0)
 
-        # Plot area fills the remaining right space
-        self._setup_plot_area(right_layout)
+        self._setup_plot_area(plot_outer_layout)
+
+        right_vsplit.addWidget(plot_outer)
+
+        # EIC list ~25 %, plot ~75 % of right panel height
+        right_vsplit.setStretchFactor(0, 1)
+        right_vsplit.setStretchFactor(1, 3)
 
         splitter.addWidget(right_widget)
 
@@ -222,12 +249,15 @@ class PeakPickingSettingsDialog(QtWidgets.QDialog):
         self.btnDefaults.clicked.connect(self._restore_defaults)
         self.btnAddEic.clicked.connect(self._add_eic_row)
         self.btnRemoveEic.clicked.connect(self._remove_eic_rows)
+        self.btnDuplicateEic.clicked.connect(self._duplicate_eic_row)
+        self.btnDuplicateEic1Da.clicked.connect(lambda: self._duplicate_eic_row_with_mz_shift(1.00335484))
+        self.btnDuplicateEicHalfDa.clicked.connect(lambda: self._duplicate_eic_row_with_mz_shift(0.50167742))
         self.btnPickEic.clicked.connect(self._run_preview)
 
     def _resize_eic_columns(self, event):
-        """Keep EIC table column widths at 60/20/10/10 ratio."""
+        """Keep EIC table column widths at 45/25/15/15 ratio (File column 25% narrower)."""
         total = self.eicTable.viewport().width()
-        ratios = [0.60, 0.20, 0.10, 0.10]
+        ratios = [0.45, 0.25, 0.15, 0.15]
         hdr = self.eicTable.horizontalHeader()
         for col, ratio in enumerate(ratios):
             hdr.resizeSection(col, max(1, int(total * ratio)))
@@ -298,6 +328,7 @@ class PeakPickingSettingsDialog(QtWidgets.QDialog):
             style="italic",
             fontsize=11,
         )
+        self._eic_figure.tight_layout()
         self._eic_canvas.draw()
 
     def _show_status_text(self, message: str, color: str = "gray"):
@@ -316,6 +347,7 @@ class PeakPickingSettingsDialog(QtWidgets.QDialog):
                 style="italic",
                 fontsize=10,
             )
+            self._eic_figure.tight_layout()
             self._eic_canvas.draw()
         else:
             self.eicPlotArea.setText(message)
@@ -344,8 +376,11 @@ class PeakPickingSettingsDialog(QtWidgets.QDialog):
 
         _EIC_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
 
-        for i, res in enumerate(results):
-            ax = fig.add_subplot(n, 1, i + 1)
+        # Create all subplots at once with a fresh GridSpec to avoid matplotlib
+        # accumulating axes from previous calls with a different row count.
+        all_axes = fig.subplots(n, 1, squeeze=False)[:, 0]
+
+        for i, (ax, res) in enumerate(zip(all_axes, results)):
             fpath, filter_line, mz, ppm = res[:4]
             rt_array, int_array, peaks, load_error, peak_error = res[4], res[5], res[6], res[7], res[8]
             fname = os.path.basename(fpath)
@@ -970,6 +1005,54 @@ class PeakPickingSettingsDialog(QtWidgets.QDialog):
     # EIC management
     # ------------------------------------------------------------------
 
+    def get_eic_rows(self):
+        """Return the current EIC table contents as a list of (file_path, filter_text, mz, ppm).
+
+        Stores the actual file path (from combobox userData) and filter line text
+        so that the rows can be stably persisted and restored across dialog openings
+        and group file save/load cycles.
+        """
+        rows = []
+        for row in range(self.eicTable.rowCount()):
+            fileW = self.eicTable.cellWidget(row, 0)
+            filterW = self.eicTable.cellWidget(row, 1)
+            mzW = self.eicTable.cellWidget(row, 2)
+            ppmW = self.eicTable.cellWidget(row, 3)
+            file_path = fileW.currentData() if fileW else None
+            filter_text = filterW.currentText() if filterW else ""
+            mz = mzW.value() if mzW else 0.0
+            ppm = ppmW.value() if ppmW else 5.0
+            rows.append((file_path, filter_text, mz, ppm))
+        return rows
+
+    def _restore_eic_rows(self, eic_rows):
+        """Populate the EIC table from a list of (file_path, filter_text, mz, ppm) tuples.
+
+        Matches the file path against combobox userData and the filter text against
+        combobox item texts.  Falls back gracefully when an entry is not found.
+        """
+        for entry in eic_rows:
+            file_path, filter_text, mz, ppm = entry
+            self._add_eic_row()
+            row = self.eicTable.rowCount() - 1
+            fileW = self.eicTable.cellWidget(row, 0)
+            if fileW and file_path is not None:
+                for i in range(fileW.count()):
+                    if fileW.itemData(i) == file_path:
+                        fileW.setCurrentIndex(i)
+                        break
+            filterW = self.eicTable.cellWidget(row, 1)
+            if filterW and filter_text:
+                idx = filterW.findText(filter_text)
+                if idx >= 0:
+                    filterW.setCurrentIndex(idx)
+            mzW = self.eicTable.cellWidget(row, 2)
+            if mzW:
+                mzW.setValue(mz)
+            ppmW = self.eicTable.cellWidget(row, 3)
+            if ppmW:
+                ppmW.setValue(ppm)
+
     def _add_eic_row(self):
         """Add a row to the EIC definition table using loaded files and filter lines."""
         row = self.eicTable.rowCount()
@@ -1019,6 +1102,83 @@ class PeakPickingSettingsDialog(QtWidgets.QDialog):
         for r in rows:
             self.eicTable.removeRow(r)
 
+    def _duplicate_eic_row(self):
+        """Duplicate the selected EIC row, inserting a copy directly below it."""
+        selected_rows = sorted({idx.row() for idx in self.eicTable.selectedIndexes()})
+        if not selected_rows:
+            return
+        # Duplicate the last selected row (insert after it)
+        src_row = selected_rows[-1]
+        insert_at = src_row + 1
+
+        # Read current widget values from the source row
+        fileW = self.eicTable.cellWidget(src_row, 0)
+        filterW = self.eicTable.cellWidget(src_row, 1)
+        mzW = self.eicTable.cellWidget(src_row, 2)
+        ppmW = self.eicTable.cellWidget(src_row, 3)
+
+        src_file_idx = fileW.currentIndex() if fileW else 0
+        src_filter_idx = filterW.currentIndex() if filterW else 0
+        src_mz = mzW.value() if mzW else 100.0
+        src_ppm = ppmW.value() if ppmW else 5.0
+
+        # Insert new row at position
+        self.eicTable.insertRow(insert_at)
+
+        # File combo
+        newFileCombo = QtWidgets.QComboBox()
+        if self._sample_files:
+            for group_name, fpath in self._sample_files:
+                fname = os.path.basename(fpath)
+                newFileCombo.addItem(f"{group_name}  \u2014  {fname}", userData=fpath)
+        else:
+            newFileCombo.addItem("(no files loaded)", userData=None)
+        newFileCombo.setCurrentIndex(src_file_idx)
+        self.eicTable.setCellWidget(insert_at, 0, newFileCombo)
+
+        # Filter combo
+        newFilterCombo = QtWidgets.QComboBox()
+        all_filter_lines = []
+        for pol_key in ("+", "-"):
+            for fl in self._scan_events.get(pol_key, []):
+                if fl and fl != "None":
+                    all_filter_lines.append(fl)
+        if all_filter_lines:
+            for fl in all_filter_lines:
+                newFilterCombo.addItem(fl)
+        else:
+            newFilterCombo.addItem("(no filter lines)")
+        newFilterCombo.setCurrentIndex(src_filter_idx)
+        self.eicTable.setCellWidget(insert_at, 1, newFilterCombo)
+
+        # m/z
+        newMzSpin = QtWidgets.QDoubleSpinBox()
+        newMzSpin.setRange(0, 99999.0)
+        newMzSpin.setDecimals(5)
+        newMzSpin.setValue(src_mz)
+        self.eicTable.setCellWidget(insert_at, 2, newMzSpin)
+
+        # ppm
+        newPpmSpin = QtWidgets.QDoubleSpinBox()
+        newPpmSpin.setRange(0.1, 1000.0)
+        newPpmSpin.setDecimals(1)
+        newPpmSpin.setValue(src_ppm)
+        self.eicTable.setCellWidget(insert_at, 3, newPpmSpin)
+
+        # Select the duplicated row
+        self.eicTable.selectRow(insert_at)
+
+    def _duplicate_eic_row_with_mz_shift(self, mz_shift: float):
+        """Duplicate the selected EIC row and offset the m/z by *mz_shift*."""
+        self._duplicate_eic_row()
+        # _duplicate_eic_row selects the new row right after insertion
+        new_row = self.eicTable.currentRow()
+        if new_row < 0:
+            return
+        mzW = self.eicTable.cellWidget(new_row, 2)
+        if mzW is not None:
+            mzW.setValue(mzW.value() + mz_shift)
+
     def _run_preview(self):
         """Attempt to load EICs and run peak picking for preview."""
         # Gather EIC definitions
@@ -1067,84 +1227,105 @@ class PeakPickingSettingsDialog(QtWidgets.QDialog):
             )
 
             settings = self._collect_settings()
-            results = []
 
-            for eic_idx, (fpath, filter_line, mz, ppm) in enumerate(eics):
-                self._progress_bar.setFormat(f"Processing {eic_idx + 1} / {len(eics)}: {os.path.basename(fpath)}")
-                self._progress_bar.setValue(eic_idx)
+            # ── Build picker once (same settings for all EICs) ─────────
+            algo = settings.get("algorithm", "wavelettransform")
+            if algo == "wavelettransform":
+                picker = WaveletTransformPeakPicker(
+                    min_scale=settings.get("wt_min_scale", 3),
+                    max_scale=settings.get("wt_max_scale", 11),
+                    num_scales=settings.get("wt_num_scales", 8),
+                    min_ridge_length=settings.get("wt_min_ridge_length", 4),
+                    gap_threshold=settings.get("wt_gap_threshold", 2),
+                )
+            elif algo == "gradientdescent":
+                picker = GradientDescentPeakPicker(
+                    smoothing_method=settings.get("gd_smoothing_method", "gaussian"),
+                    smoothing_window=settings.get("gd_smoothing_window", 5),
+                    smoothing_iterations=settings.get("gd_smoothing_iterations", 1),
+                    min_increase_ratio=settings.get("gd_min_increase_ratio", 0.05),
+                    consecutive_scans=settings.get("gd_consecutive_scans", 3),
+                )
+            elif algo == "gmm":
+                picker = GMMPeakPicker(
+                    distribution=settings.get("gmm_distribution", "gaussian"),
+                )
+            elif algo == "secondderivative":
+                picker = SecondDerivativePeakPicker(
+                    sg_window=settings.get("sd_sg_window", 11),
+                )
+            elif algo == "matchedfilter":
+                picker = MatchedFilterPeakPicker(
+                    expected_peak_width=settings.get("mf_expected_peak_width", 15),
+                )
+            else:
+                picker = WaveletTransformPeakPicker()
+
+            # ── Group EIC rows by file path to load each file only once ─
+            # eic_by_file: {fpath: [(original_idx, filter_line, mz, ppm), ...]}
+            from collections import OrderedDict
+
+            eic_by_file: dict = OrderedDict()
+            for orig_idx, (fpath, filter_line, mz, ppm) in enumerate(eics):
+                eic_by_file.setdefault(fpath, []).append((orig_idx, filter_line, mz, ppm))
+
+            # Pre-allocate results list (filled by original index)
+            results = [None] * len(eics)
+
+            processed = 0
+            for fpath, file_eics in eic_by_file.items():
+                # Load the file once
+                chromatogram = None
+                file_load_error = None
+                self._progress_bar.setFormat(f"Loading {os.path.basename(fpath)}…")
                 QtWidgets.QApplication.processEvents()
-
-                rt_array = None
-                int_array = None
-                peaks = []
-                load_error = None
-                peak_error = None
-
-                # Step 1: load EIC
                 try:
-                    mzxml = Chromatogram()
-                    mzxml.parse_file(fpath)
-                    eic_data, times, scan_ids, mzs = mzxml.getEIC(mz, ppm, filterLine=filter_line)
-                    rt_array = np.array(times, dtype=float)
-                    int_array = np.array(eic_data, dtype=float)
+                    chromatogram = Chromatogram()
+                    chromatogram.parse_file(fpath)
                 except Exception as e:
-                    load_error = str(e)
+                    file_load_error = str(e)
 
-                # Step 2: pick peaks (only if EIC loaded successfully)
-                if rt_array is not None:
-                    try:
-                        algo = settings.get("algorithm", "wavelettransform")
-                        if algo == "wavelettransform":
-                            picker = WaveletTransformPeakPicker(
-                                min_scale=settings.get("wt_min_scale", 3),
-                                max_scale=settings.get("wt_max_scale", 11),
-                                num_scales=settings.get("wt_num_scales", 8),
-                                min_ridge_length=settings.get("wt_min_ridge_length", 4),
-                                gap_threshold=settings.get("wt_gap_threshold", 2),
-                            )
-                        elif algo == "gradientdescent":
-                            picker = GradientDescentPeakPicker(
-                                smoothing_method=settings.get("gd_smoothing_method", "gaussian"),
-                                smoothing_window=settings.get("gd_smoothing_window", 5),
-                                smoothing_iterations=settings.get("gd_smoothing_iterations", 1),
-                                min_increase_ratio=settings.get("gd_min_increase_ratio", 0.05),
-                                consecutive_scans=settings.get("gd_consecutive_scans", 3),
-                            )
-                        elif algo == "gmm":
-                            picker = GMMPeakPicker(
-                                distribution=settings.get("gmm_distribution", "gaussian"),
-                            )
-                        elif algo == "secondderivative":
-                            picker = SecondDerivativePeakPicker(
-                                sg_window=settings.get("sd_sg_window", 11),
-                            )
-                        elif algo == "matchedfilter":
-                            picker = MatchedFilterPeakPicker(
-                                expected_peak_width=settings.get("mf_expected_peak_width", 15),
-                            )
-                        else:
-                            picker = WaveletTransformPeakPicker()
+                for orig_idx, filter_line, mz, ppm in file_eics:
+                    processed += 1
+                    self._progress_bar.setFormat(f"Processing {processed} / {len(eics)}: {os.path.basename(fpath)}")
+                    self._progress_bar.setValue(processed - 1)
+                    QtWidgets.QApplication.processEvents()
 
-                        peaks = picker.pick_peaks(rt_array, int_array) or []
+                    rt_array = None
+                    int_array = None
+                    peaks = []
+                    load_error = file_load_error
+                    peak_error = None
 
-                        # Apply post-processing peak filters (algorithm-independent)
-                        if settings.get("pf_enabled", False):
-                            peaks = filter_peaks(
-                                peaks,
-                                min_peak_width=settings.get("pf_min_peak_width", 0.0),
-                                max_peak_width=settings.get("pf_max_peak_width", 9999.0),
-                                min_fwhm=settings.get("pf_min_fwhm", 0.0),
-                                max_fwhm=settings.get("pf_max_fwhm", 9999.0),
-                                min_apex_to_flank_factor=settings.get("pf_min_apex_to_flank_factor", 0.0),
-                                min_apex_to_flank_increase=settings.get("pf_min_apex_to_flank_increase", 0.0),
-                                min_snr=settings.get("pf_min_snr", 0.0),
-                            )
-                    except Exception as e:
-                        peak_error = str(e)
-                        peaks = []
+                    if chromatogram is not None:
+                        try:
+                            eic_data, times, scan_ids, mzs = chromatogram.getEIC(mz, ppm, filterLine=filter_line)
+                            rt_array = np.array(times, dtype=float)
+                            int_array = np.array(eic_data, dtype=float)
+                        except Exception as e:
+                            load_error = str(e)
 
-                # results tuple: (fpath, filter_line, mz, ppm, rt_array, int_array, peaks, load_error, peak_error)
-                results.append((fpath, filter_line, mz, ppm, rt_array, int_array, peaks, load_error, peak_error))
+                    if rt_array is not None:
+                        try:
+                            peaks = picker.pick_peaks(rt_array, int_array) or []
+
+                            if settings.get("pf_enabled", False):
+                                peaks = filter_peaks(
+                                    peaks,
+                                    min_peak_width=settings.get("pf_min_peak_width", 0.0),
+                                    max_peak_width=settings.get("pf_max_peak_width", 9999.0),
+                                    min_fwhm=settings.get("pf_min_fwhm", 0.0),
+                                    max_fwhm=settings.get("pf_max_fwhm", 9999.0),
+                                    min_apex_to_flank_factor=settings.get("pf_min_apex_to_flank_factor", 0.0),
+                                    min_apex_to_flank_increase=settings.get("pf_min_apex_to_flank_increase", 0.0),
+                                    min_snr=settings.get("pf_min_snr", 0.0),
+                                )
+                        except Exception as e:
+                            peak_error = str(e)
+                            peaks = []
+
+                    # results tuple: (fpath, filter_line, mz, ppm, rt_array, int_array, peaks, load_error, peak_error)
+                    results[orig_idx] = (fpath, filter_line, mz, ppm, rt_array, int_array, peaks, load_error, peak_error)
 
             self._progress_bar.setValue(len(eics))
             self._progress_bar.setFormat("Done")

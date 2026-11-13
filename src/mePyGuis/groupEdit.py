@@ -1,6 +1,7 @@
 from __future__ import absolute_import, division, print_function
 import os
 from PySide6 import QtCore, QtGui, QtWidgets
+from ..rawImport import UnsupportedFileError, prepare_import_files
 from ..utils import natSort
 from .groupEditor import Ui_GroupEditor
 
@@ -134,18 +135,26 @@ class groupEdit(QtWidgets.QDialog, Ui_GroupEditor):
         return False
 
     def selectFiles(self):
-        filenames = QtWidgets.QFileDialog.getOpenFileNames(
+        filenames, _selected_filter = QtWidgets.QFileDialog.getOpenFileNames(
             self,
             caption="Select group file(s)",
             dir=self.initDir,
             filter="mzXML (*.mzxml);;mzML (*.mzml);;group file (*.grp);;All files (*.*)",
         )
-        filenames = list(filenames)
         filenames = natSort(filenames)
+        raw_filenames = [filename for filename in filenames if filename.lower().endswith(".raw")]
+        try:
+            converted_raw_filenames = prepare_import_files(raw_filenames) if raw_filenames else []
+        except UnsupportedFileError:
+            return
+        converted_raw_by_source = dict(zip(raw_filenames, converted_raw_filenames))
 
         for filename in filenames:
-            self.groupFiles.addItem(filename.replace("\\", "/"))
-            self.groupfiles.append(filename)
+            if filename.lower().endswith(".raw"):
+                filename = converted_raw_by_source[filename]
+            if filename.lower().endswith(".mzxml") or filename.lower().endswith(".mzml"):
+                self.groupFiles.addItem(filename.replace("\\", "/"))
+                self.groupfiles.append(filename)
         if len(filenames) > 0:
             self.initDir = str(filenames[0]).replace("\\", "/")
             self.initDir = self.initDir[: self.initDir.rfind("/")]
@@ -221,7 +230,15 @@ class groupEdit(QtWidgets.QDialog, Ui_GroupEditor):
                 links.append(str(url.toLocalFile()).replace("\\", "/"))
 
             links = natSort(links)
+            raw_links = [link for link in links if link.lower().endswith(".raw")]
+            try:
+                converted_raw_links = prepare_import_files(raw_links) if raw_links else []
+            except UnsupportedFileError:
+                return
+            converted_raw_by_source = dict(zip(raw_links, converted_raw_links))
             for link in links:
+                if link.lower().endswith(".raw"):
+                    link = converted_raw_by_source[link]
                 if link.lower().endswith(".mzxml") or link.lower().endswith(".mzml"):
                     self.groupFiles.addItem(link)
                     self.groupfiles.append(link)

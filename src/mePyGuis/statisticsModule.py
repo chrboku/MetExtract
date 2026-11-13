@@ -33,6 +33,7 @@ class StatisticsData:
         self.imputation_method: str = "zero"  # "zero" or "lod_half"
         self.feature_filter: str = "all"  # "all" or "most_abundant"
         self.group_info: Dict[str, List[str]] = {}  # group_name -> [sample_names]
+        self.group_colors: Dict[str, str] = {}  # group_name -> hex color, synced with the Input tab's group colors
         self.feature_metadata: Optional[pd.DataFrame] = None
         self.selected_features: List[int] = []
         self.volcano_comparisons: List[Tuple[str, str]] = []  # (group1, group2) pairs
@@ -83,6 +84,9 @@ class StatisticsData:
                 logging.info(f"Group info loaded: {list(self.group_info.keys())}")
                 for group_name, samples in self.group_info.items():
                     logging.info(f"  Group '{group_name}': {samples[:3] if len(samples) > 3 else samples}...")
+
+            if "group_colors" in experiment_data:
+                self.group_colors = experiment_data["group_colors"]
 
             if "metadata" in experiment_data:
                 self.feature_metadata = pd.DataFrame(experiment_data["metadata"])
@@ -286,8 +290,19 @@ class DataQualityAnalysis:
 class MultivariateAnalysis:
     """Performs multivariate statistical analyses (PCA, HCA, Heatmap)."""
 
+    TRANSFORM_OFFSET = 1.0
+
     @staticmethod
-    def perform_pca(data: pd.DataFrame, n_components: int = 2, scale: bool = True) -> Dict[str, Any]:
+    def transform_abundances(X: np.ndarray, transform: str = "none") -> np.ndarray:
+        """Apply 'none', 'log10' or 'sqrt' transformation after adding a constant offset (avoids log(0))."""
+        if transform == "log10":
+            return np.log10(X + MultivariateAnalysis.TRANSFORM_OFFSET)
+        if transform == "sqrt":
+            return np.sqrt(X + MultivariateAnalysis.TRANSFORM_OFFSET)
+        return X
+
+    @staticmethod
+    def perform_pca(data: pd.DataFrame, n_components: int = 2, scale: bool = True, transform: str = "none") -> Dict[str, Any]:
         """
         Perform Principal Component Analysis.
 
@@ -307,6 +322,7 @@ class MultivariateAnalysis:
 
             # Handle missing values
             X = np.nan_to_num(X, nan=0)
+            X = MultivariateAnalysis.transform_abundances(X, transform)
 
             if scale:
                 scaler = StandardScaler()
@@ -328,7 +344,7 @@ class MultivariateAnalysis:
             return {"success": False, "error": str(e)}
 
     @staticmethod
-    def perform_hca(data: pd.DataFrame, method: str = "ward", metric: str = "euclidean") -> Dict[str, Any]:
+    def perform_hca(data: pd.DataFrame, method: str = "ward", metric: str = "euclidean", transform: str = "none") -> Dict[str, Any]:
         """
         Perform Hierarchical Cluster Analysis.
 
@@ -343,6 +359,7 @@ class MultivariateAnalysis:
         try:
             X = data.T.values
             X = np.nan_to_num(X, nan=0)
+            X = MultivariateAnalysis.transform_abundances(X, transform)
 
             # Standardize
             scaler = StandardScaler()
@@ -360,7 +377,7 @@ class MultivariateAnalysis:
             return {"success": False, "error": str(e)}
 
     @staticmethod
-    def prepare_heatmap_data(data: pd.DataFrame, scale_rows: bool = True, cluster_rows: bool = True, cluster_cols: bool = True) -> Dict[str, Any]:
+    def prepare_heatmap_data(data: pd.DataFrame, scale_rows: bool = True, cluster_rows: bool = True, cluster_cols: bool = True, transform: str = "none") -> Dict[str, Any]:
         """
         Prepare data for heatmap visualization.
 
@@ -376,6 +393,7 @@ class MultivariateAnalysis:
         try:
             heatmap_data = data.values.copy()
             heatmap_data = np.nan_to_num(heatmap_data, nan=0)
+            heatmap_data = MultivariateAnalysis.transform_abundances(heatmap_data, transform)
 
             if scale_rows:
                 # Z-score scaling per row
@@ -516,9 +534,9 @@ class UnivariateAnalysis:
                             fp_id = metadata.loc[idx, "num"] if "num" in metadata.columns else 0
                             fg_id = metadata.loc[idx, "ogroup"] if "ogroup" in metadata.columns else 0
 
-                            # Convert to int if not None/NaN
-                            fp_id = int(fp_id) if pd.notna(fp_id) else 0
-                            fg_id = int(fg_id) if pd.notna(fg_id) else 0
+                            # IDs may be strings; preserve their original values for matching.
+                            fp_id = fp_id if pd.notna(fp_id) else 0
+                            fg_id = fg_id if pd.notna(fg_id) else 0
 
                             feature_pair_ids.append(fp_id)
                             feature_group_ids.append(fg_id)

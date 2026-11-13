@@ -72,3 +72,4 @@ sfcache.pqts/cache.parquet
 run_382_forPublication.bat
 .R-4.5.1/
 RPATH.conf
+ext_sw/

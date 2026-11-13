@@ -614,6 +614,15 @@ class ChromPeakPair:
         if "isotopologRatios" in args:
             self.isotopologRatios = args["isotopologRatios"]
             argsUsed += 1
+        if "isoAreas" in args:
+            self.isoAreas = args["isoAreas"]
+            argsUsed += 1
+        if "isoEnrichment" in args:
+            self.isoEnrichment = args["isoEnrichment"]
+            argsUsed += 1
+        if "isoCount" in args:
+            self.isoCount = args["isoCount"]
+            argsUsed += 1
         if "mzDiffErrors" in args:
             self.mzDiffErrors = args["mzDiffErrors"]
             argsUsed += 1
@@ -865,6 +874,29 @@ def getXCombinations(elements, startTupleSize=2, endTupleSize=-1):
     return j
 
 
+# Processing-level constants: control which pipeline step(s) a group's files take part in.
+GROUP_LEVEL_NORMAL = "normal"
+GROUP_LEVEL_EXCLUDE_STEP1 = "exclude_step1"
+GROUP_LEVEL_REINTEGRATION_ONLY = "reintegration_only"
+GROUP_LEVEL_MSMS_ONLY = "msms_only"
+
+# Order in which the levels are shown in the UI drop-down (also the natural "increasing exclusion" order)
+GROUP_PROCESSING_LEVEL_ORDER = [
+    GROUP_LEVEL_NORMAL,
+    GROUP_LEVEL_EXCLUDE_STEP1,
+    GROUP_LEVEL_REINTEGRATION_ONLY,
+    GROUP_LEVEL_MSMS_ONLY,
+]
+
+# Human readable labels used in the group table's "Processing" combo box
+GROUP_PROCESSING_LEVEL_LABELS = {
+    GROUP_LEVEL_NORMAL: "Process normally",
+    GROUP_LEVEL_EXCLUDE_STEP1: "Exclude step 1",
+    GROUP_LEVEL_REINTEGRATION_ONLY: "Use only for re-integration",
+    GROUP_LEVEL_MSMS_ONLY: "Do not process (use MSMS spectra only)",
+}
+
+
 # HELPER CLASS for storing a defined group
 class SampleGroup:
     def __init__(
@@ -877,6 +909,7 @@ class SampleGroup:
         removeAsFalsePositive,
         color,
         useAsMSMSTarget,
+        processingLevel=GROUP_LEVEL_NORMAL,
     ):
         self.name = name
         self.files = files
@@ -886,6 +919,7 @@ class SampleGroup:
         self.removeAsFalsePositive = removeAsFalsePositive
         self.color = color
         self.useAsMSMSTarget = useAsMSMSTarget
+        self.processingLevel = processingLevel if processingLevel in GROUP_PROCESSING_LEVEL_LABELS else GROUP_LEVEL_NORMAL
 
 
 def is_int(s):

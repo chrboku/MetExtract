@@ -7,6 +7,7 @@ class MSScan:
         self.id = 0
         self.peak_count = 0
         self.filter_line = ""
+        self.filter_string = ""
         self.retention_time = 0.0
         self.low_mz = 0.0
         self.high_mz = 0.0
@@ -101,6 +102,7 @@ class MSScan:
 class MS1Scan(MSScan):
     def __init__(self):
         super().__init__()
+        self.cvParams = []  # List of cvParam dicts with accession, cvRef, name, value
 
 
 class MS2Scan(MSScan):
@@ -113,3 +115,4 @@ class MS2Scan(MSScan):
         self.precursorCharge = 0
         self.collisionEnergy = 0.0
         self.activationMethod = ""
+        self.cvParams = []  # List of cvParam dicts with accession, cvRef, name, value

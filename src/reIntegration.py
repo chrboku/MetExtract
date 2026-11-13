@@ -17,7 +17,9 @@
 
 from __future__ import absolute_import, division, print_function
 import gc
+import json
 import logging
+import os
 import time
 import traceback
 from multiprocessing import Manager, Pool
@@ -150,9 +152,92 @@ class ReIntegrationProcessor:
             start_rt_min = pk.start_rt / 60.0
             apex_rt_min = pk.apex_rt / 60.0
             end_rt_min = pk.end_rt / 60.0
-            return pk.area, peakAbundance, pk.snr, fwhm_min, peak_width_min, apex_to_flank_factor, apex_to_flank_increase, start_rt_min, apex_rt_min, end_rt_min
+            return (
+                pk.area,
+                peakAbundance,
+                pk.snr,
+                fwhm_min,
+                peak_width_min,
+                apex_to_flank_factor,
+                apex_to_flank_increase,
+                start_rt_min,
+                apex_rt_min,
+                end_rt_min,
+                pk.start_index,
+                pk.end_index,
+            )
 
         return None
+
+    def _quantifyIsotopologPattern(self, mz, lmz, loading, xCount, xOffset, scanEvent, ppm, lb, rb):
+        """Quantify the isotopologs from M-2 to M'+2 (named "M+x / M'-(Xn-x)") over a common
+        integration border and calculate the M/M' isotopic enrichment, mirroring
+        findIsoPairs.calculateIsotopologEnrichmentForFeaturePairs but for a re-integrated peak.
+
+        Returns:
+            Tuple of (isoAreas dict, isoEnrichment dict, isoCount)
+        """
+        import numpy as np
+
+        from .formulaTools import calcIsoEnrichment, isotopologLabel
+
+        def _peak_area(eic, times, lb, rb):
+            rb = min(rb, len(eic) - 1)
+            lb = max(lb, 0)
+            if lb >= rb:
+                return 0.0
+            return float(np.trapezoid(eic[lb : rb + 1], times[lb : rb + 1]))
+
+        eic_M, times_M, _, _ = self.chromatogram.getEIC(mz, ppm, filterLine=scanEvent)
+        eic_Mp, times_Mp, _, _ = self.chromatogram.getEIC(lmz, ppm, filterLine=scanEvent)
+        eic_M = np.asarray(eic_M, dtype=np.float64)
+        eic_Mp = np.asarray(eic_Mp, dtype=np.float64)
+        times_M = np.asarray(times_M, dtype=np.float64)
+        times_Mp = np.asarray(times_Mp, dtype=np.float64)
+
+        area_M = _peak_area(eic_M, times_M, lb, rb)
+        area_Mp = _peak_area(eic_Mp, times_Mp, lb, rb)
+
+        if area_M <= 0 and area_Mp <= 0:
+            return {}, {}, 0
+
+        refArea = min(area_M, area_Mp) if area_M > 0 and area_Mp > 0 else max(area_M, area_Mp)
+        threshold = 0.01 * refArea
+
+        areasByX = {}
+        for x in range(-2, xCount + 3):
+            if x == 0:
+                areasByX[x] = area_M
+            elif x == xCount:
+                areasByX[x] = area_Mp
+            else:
+                target_mz = mz + x * xOffset / loading
+                eic_x, times_x, _, _ = self.chromatogram.getEIC(target_mz, ppm, filterLine=scanEvent)
+                eic_x = np.asarray(eic_x, dtype=np.float64)
+                times_x = np.asarray(times_x, dtype=np.float64)
+                areasByX[x] = _peak_area(eic_x, times_x, lb, rb)
+
+        isoAreas = {isotopologLabel(x, xCount): a for x, a in areasByX.items() if a >= threshold}
+        isoCount = sum(1 for x in range(1, xCount) if areasByX.get(x, 0.0) >= threshold)
+
+        # native-side enrichment: use M and the highest contiguously-detected M+x
+        nativeX = 0
+        for x in range(1, xCount):
+            if areasByX.get(x, 0.0) >= threshold:
+                nativeX = x
+            else:
+                break
+
+        isoEnrichment = {}
+        if nativeX >= 1 and area_M > 0:
+            isoEnrichment["M"] = calcIsoEnrichment(xCount, nativeX, areasByX[nativeX] / area_M)
+
+        # labelled-side enrichment: use M' and M'-1 (M itself if xCount == 1)
+        areaMpMinus1 = areasByX.get(xCount - 1, area_M) if xCount >= 2 else area_M
+        if area_Mp > 0 and areaMpMinus1 > 0:
+            isoEnrichment["M'"] = calcIsoEnrichment(xCount, 1, areaMpMinus1 / area_Mp)
+
+        return isoAreas, isoEnrichment, isoCount
 
     def processFeaturePair(
         self,
@@ -173,6 +258,9 @@ class ReIntegrationProcessor:
         addPeakAbundance,
         addPeakSNR,
         peak_filter_config=None,
+        xCount=None,
+        loading=None,
+        xOffset=None,
     ):
         """
         Re-integrate one detected feature pair.
@@ -212,8 +300,9 @@ class ReIntegrationProcessor:
             logging.error(f"   - Reintegration failed for feature pair (N) {self.forFile} ({mz} {rt}) [{exc}]")
 
         nFound = False
+        n_start_index = n_end_index = None
         if r is not None:
-            area, abundance, snr, fwhm_min, peak_width_min, apex_factor, apex_increase, start_rt_min, apex_rt_min, end_rt_min = r
+            area, abundance, snr, fwhm_min, peak_width_min, apex_factor, apex_increase, start_rt_min, apex_rt_min, end_rt_min, n_start_index, n_end_index = r
             result[f"{fileName}_Found"] = "Reintegrated"
             result[f"{fileName}_Area_N"] = area
             result[f"{fileName}_Abundance_N"] = abundance
@@ -245,8 +334,9 @@ class ReIntegrationProcessor:
             logging.error(f"   - Reintegration failed for feature pair (L) {self.forFile} ({lmz} {rt}) [{exc}]")
 
         lFound = False
+        l_start_index = l_end_index = None
         if r is not None:
-            area, abundance, snr, fwhm_min, peak_width_min, apex_factor, apex_increase, start_rt_min, apex_rt_min, end_rt_min = r
+            area, abundance, snr, fwhm_min, peak_width_min, apex_factor, apex_increase, start_rt_min, apex_rt_min, end_rt_min, l_start_index, l_end_index = r
             result[f"{fileName}_Found"] = "Reintegrated"
             result[f"{fileName}_Area_L"] = area
             result[f"{fileName}_Abundance_L"] = abundance
@@ -259,6 +349,24 @@ class ReIntegrationProcessor:
             result[f"{fileName}_L_apexRT"] = apex_rt_min
             result[f"{fileName}_L_endRT"] = end_rt_min
             lFound = True
+
+        # Quantify the isotopolog pattern (M+x) between M and M' using the common
+        # integration border spanning both re-integrated peak boundaries.
+        if (nFound or lFound) and xCount and loading and xOffset is not None:
+            if nFound and lFound:
+                lb, rb = min(n_start_index, l_start_index), max(n_end_index, l_end_index)
+            elif nFound:
+                lb, rb = n_start_index, n_end_index
+            else:
+                lb, rb = l_start_index, l_end_index
+
+            try:
+                isoAreas, isoEnrichment, isoCount = self._quantifyIsotopologPattern(mz, lmz, loading, int(xCount), xOffset, scanEvent, ppm, lb, rb)
+                result[f"{fileName}_isoArea"] = json.dumps(isoAreas)
+                result[f"{fileName}_isoEnrichment"] = json.dumps(isoEnrichment)
+                result[f"{fileName}_isoCount"] = str(isoCount)
+            except Exception as exc:
+                logging.error(f"   - Isotopolog quantification failed for feature pair {self.forFile} ({mz} {rt}) [{exc}]")
 
         # Track for database if found
         if nFound or lFound:
@@ -279,7 +387,7 @@ class ReIntegrationProcessor:
             List of re-integration results
         """
         startProc = time.time()
-        logging.info(f"   Reintegration started for file {self.forFile}")
+        logging.info(f"   Reintegration started for file {os.path.basename(self.forFile)}")
 
         if self.queue is not None:
             self.queue.put(Bunch(pid=self.pID, mes="start"))
@@ -335,6 +443,9 @@ class ReIntegrationProcessor:
                             addPeakAbundance=params.addPeakAbundance,
                             addPeakSNR=params.addPeakSNR,
                             peak_filter_config=getattr(params, "peak_filter_config", None),
+                            xCount=feature.get("xCount"),
+                            loading=feature.get("loading"),
+                            xOffset=getattr(params, "xOffset", None),
                         )
                         if result and result.get("found", False):
                             del result["found"]
@@ -348,10 +459,10 @@ class ReIntegrationProcessor:
             self.chromatogram.freeMe()
             gc.collect()
 
-            logging.info(f"   Reintegration finished for file {self.forFile} ({(time.time() - startProc) / 60.0:.1f} minutes)")
+            logging.info(f"   Reintegration finished for file {os.path.basename(self.forFile)} ({(time.time() - startProc) / 60.0:.1f} minutes)")
 
         except Exception as e:
-            logging.error(f"Error during reintegration of {self.forFile}: {e}")
+            logging.error(f"Error during reintegration of {os.path.basename(self.forFile)}: {e}")
             traceback.print_exc()
 
         finally:
@@ -403,6 +514,7 @@ def reIntegrateResultsFile(
     start=0,
     peak_filter_config=None,
     peak_picker=None,
+    xOffset=None,
 ):
     """
     Re-integrate all LC-HRMS data files with the grouped feature pairs results using PolarsDB.
@@ -434,6 +546,8 @@ def reIntegrateResultsFile(
         selfObj: Reference to main object (for job termination)
         cpus: Number of CPU cores to use
         start: Start time for elapsed time calculation
+        xOffset: Mass difference between the labelling isotopes (isotopeB - isotopeA), used to
+            quantify the M+x isotopologs and their M/M' enrichment for re-integrated features
     """
     logging.info("Starting re-integration of missed peaks using PolarsDB")
     excel_file = file.replace(".xlsx", ".tsv").replace(".tsv", ".txt").replace(".txt", "") + ".xlsx"
@@ -476,6 +590,8 @@ def reIntegrateResultsFile(
                         "RT": row["RT"],
                         "L_MZ": row["L_MZ"],
                         "ionMode": row["Ionisation_Mode"],
+                        "xCount": row["Xn"],
+                        "loading": row["Charge"],
                     }
                 )
 
@@ -498,6 +614,7 @@ def reIntegrateResultsFile(
             addPeakSNR=addPeakSNR,
             peak_filter_config=peak_filter_config,
             peak_picker=peak_picker,
+            xOffset=xOffset,
         )
         processor.params = params
 
@@ -657,6 +774,12 @@ def reIntegrateResultsFile(
             new_columns[f"{fileName}_L_apexRT"] = [None] * len(results_df)
         if f"{fileName}_L_endRT" not in results_df.columns:
             new_columns[f"{fileName}_L_endRT"] = [None] * len(results_df)
+        if f"{fileName}_isoArea" not in results_df.columns:
+            new_columns[f"{fileName}_isoArea"] = [None] * len(results_df)
+        if f"{fileName}_isoEnrichment" not in results_df.columns:
+            new_columns[f"{fileName}_isoEnrichment"] = [None] * len(results_df)
+        if f"{fileName}_isoCount" not in results_df.columns:
+            new_columns[f"{fileName}_isoCount"] = [None] * len(results_df)
 
     # Add new columns to dataframe
     for col_name, col_data in new_columns.items():
@@ -666,7 +789,7 @@ def reIntegrateResultsFile(
     print("Updating results in all_results table")
 
     for row_idx, row in enumerate(results_df.iter_rows()):
-        num = int(results_df[row_idx, "Num"])
+        num = results_df[row_idx, "Num"]
         if num not in all_results.keys():
             pass
         else:

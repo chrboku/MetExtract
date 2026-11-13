@@ -3,6 +3,7 @@ import multiprocessing
 from copy import deepcopy
 import polars as pl
 from ..formulaTools import formulaTools
+from ..isotopeScoring import compute_isotope_pattern, isotope_ratio_columns, isotope_ratio_json_fields
 from ..SGR import SGRGenerator
 from ..utils import Bunch
 from ..ParquetCache import ParquetCache
@@ -295,14 +296,18 @@ def processPolarsTable(
             pwValSet(idx)
 
         dbe = {smCol + k: [] for k in suffix_keys}
+        other_isotopologs = row_dict.get("Other_Isotopologs")
         for callStr, ion_label, m in this_row_jobs:
             for e in formula_dict.get(callStr, []):
                 mT = fT.calcMolWeight(fT.parseFormula(e))
+                isotope_abs_error, isotope_ratios = compute_isotope_pattern(e, other_isotopologs)
                 ent = {
                     "formula": e,
                     "ion": ion_label,
                     "mass_error_ppm": (m - mT) * 1e6 / m,
                     "mass_error_mass": m - mT,
+                    "isotope_abs_error": isotope_abs_error,
+                    **isotope_ratio_json_fields(isotope_ratios),
                 }
 
                 has_n = "N" in ent["formula"]
@@ -340,6 +345,8 @@ def processPolarsTable(
                         "Ion_Adduct": ion_label,
                         "MassErrorPPM": ent["mass_error_ppm"],
                         "MassErrorMass": ent["mass_error_mass"],
+                        "Iso_AE": isotope_abs_error,
+                        **isotope_ratio_columns(isotope_ratios),
                         "Feature_Num": row_dict.get(columns[exID]),
                         "Feature_RT": row_dict.get(columns[exRT]),
                         "Feature_MZ": row_dict.get(columns[exMZ]),

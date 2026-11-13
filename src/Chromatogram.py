@@ -1,5 +1,8 @@
 from __future__ import absolute_import, division, print_function
 import base64
+import hashlib
+import os
+import pickle
 import struct
 import sys
 import xml.parsers.expat
@@ -393,6 +396,14 @@ class Chromatogram:
             if "activationMethod" in attrs:
                 self.MS2_list[-1].activationMethod = str(attrs["activationMethod"])
 
+        # Extract cvParams from scan elements (for mzML format)
+        if name == "cvParam" and len(self.MS2_list) > 0 and self.msLevel == 2:
+            cv_dict = {"accession": attrs.get("accession", ""), "cvRef": attrs.get("cvRef", ""), "name": attrs.get("name", ""), "value": attrs.get("value", "")}
+            self.MS2_list[-1].cvParams.append(cv_dict)
+        elif name == "cvParam" and len(self.MS1_list) > 0 and self.msLevel == 1:
+            cv_dict = {"accession": attrs.get("accession", ""), "cvRef": attrs.get("cvRef", ""), "name": attrs.get("name", ""), "value": attrs.get("value", "")}
+            self.MS1_list[-1].cvParams.append(cv_dict)
+
         if name == "scan":
             self.curScan = self.curScan + 1
 
@@ -656,10 +667,23 @@ class Chromatogram:
                 raise RuntimeError("No polarity for scan available")
 
             tmp_ms.id = int(spectrum["id"])
-            if "filter string" in spectrum.__dict__.keys():
-                tmp_ms.filter_line = spectrum["filter string"]
-            else:
-                tmp_ms.filter_line = f"NA // MSLevel: {msLevel}, polarity: {tmp_ms.polarity}"
+            if msLevel == 1:
+                if "filter string" in spectrum.__dict__.keys():
+                    tmp_ms.filter_line = spectrum["filter string"]
+                else:
+                    tmp_ms.filter_line = f"NA // MSLevel: {msLevel}, polarity: {tmp_ms.polarity}"
+            if msLevel == 2:
+                filter_str = None
+                try:
+                    if "filter string" in spectrum:
+                        filter_str = spectrum["filter string"]
+                except (KeyError, TypeError):
+                    filter_str = None
+                if filter_str:
+                    tmp_ms.filter_line = filter_str
+                    tmp_ms.filter_string = filter_str
+                else:
+                    tmp_ms.filter_line = f"NA // MSLevel: {msLevel}, polarity: {tmp_ms.polarity}"
 
             tmp_ms.peak_count = len(spectrum.peaks(peak_type="centroided"))
             tmp_ms.retention_time = spectrum.scan_time_in_minutes() * 60.0
@@ -721,9 +745,55 @@ class Chromatogram:
         if filename_xml.lower().endswith(".mzxml"):
             return self.parseMZXMLFile(filename_xml, intensityCutoff, ignoreCharacterData)
         elif filename_xml.lower().endswith(".mzml"):
-            return self.parseMzMLFile(filename_xml, intensityCutoff, ignoreCharacterData)
+            return self._parseMzMLFileCached(filename_xml, intensityCutoff, ignoreCharacterData)
         else:
             raise RuntimeError("Invalid file type")
+
+    @staticmethod
+    def _sha256OfFile(filename):
+        h = hashlib.sha256()
+        with open(filename, "rb") as f:
+            for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    # Parsing mzML files is slow. The parsed data is therefore cached in "<file>.mzML.cache" (pickled
+    # dictionary with the sha256 hash of the mzML file and the parsed object) next to the original file.
+    # The cache is only used if the hash of the mzML file matches the stored one.
+    def _parseMzMLFileCached(self, filename_xml, intensityCutoff, ignoreCharacterData):
+        cache_file = filename_xml + ".cache"
+        file_hash = self._sha256OfFile(filename_xml)
+
+        if os.path.isfile(cache_file):
+            try:
+                with open(cache_file, "rb") as f:
+                    cache = pickle.load(f)
+                if cache["sha256"] == file_hash:
+                    cached = cache["mzml_object"]
+                    self.MS1_list = cached.MS1_list
+                    self.MS2_list = cached.MS2_list
+                    self.msInstruments = cached.msInstruments
+                    return
+            except Exception as e:
+                print(f"Warning: Could not load cache file '{cache_file}', parsing mzML file again: {e}")
+
+        self.parseMzMLFile(filename_xml, intensityCutoff, ignoreCharacterData)
+
+        tmp_file = f"{cache_file}.{os.getpid()}.tmp"
+        try:
+            cached = Chromatogram()
+            cached.MS1_list = self.MS1_list
+            cached.MS2_list = self.MS2_list
+            cached.msInstruments = self.msInstruments
+            with open(tmp_file, "wb") as f:
+                pickle.dump({"sha256": file_hash, "mzml_object": cached}, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp_file, cache_file)
+        except Exception as e:
+            print(f"Warning: Could not write cache file '{cache_file}': {e}")
+            try:
+                os.remove(tmp_file)
+            except Exception:
+                pass
 
     # updates the data of this MS scan
     # WARNING: unstable, horridly implemented method. SUBJECT OF CHANGE
