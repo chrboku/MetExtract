@@ -893,6 +893,7 @@ class StatisticsTabWidget(QWidget):
     # Signal to switch to experiment results and show a specific feature
     showFeatureInExperiment = Signal(str)
     idsFilterRequested = Signal(list, list)  # (ogroups, nums) forwarded from volcano Ctrl+drag rectangles
+    comparisonsChanged = Signal()  # a univariate comparison was added or removed
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1886,6 +1887,7 @@ class StatisticsTabWidget(QWidget):
                 # Add to tree
                 QTreeWidgetItem(self.volcano_parent_item, [f"{group1} vs {group2}"])
                 self.methods_tree.expandItem(self.volcano_parent_item)
+                self.comparisonsChanged.emit()
 
     def _remove_volcano_comparison(self):
         """Remove the selected volcano comparison."""
@@ -1903,6 +1905,7 @@ class StatisticsTabWidget(QWidget):
 
                 # Remove from tree
                 self.volcano_parent_item.removeChild(current_item)
+                self.comparisonsChanged.emit()
 
     def _on_features_selected(self, indices: List[int]):
         """Handle feature selection from volcano plots."""
@@ -2023,6 +2026,27 @@ class StatisticsTabWidget(QWidget):
 
         if selected_feature_ids:
             self.showFeatureInExperiment.emit(str(selected_feature_ids[0]))
+
+    def get_comparisons(self) -> List[Tuple[str, str]]:
+        """The (group 1, group 2) univariate comparisons currently defined in the Volcano Plots tree."""
+        return list(self.stats_data.volcano_comparisons)
+
+    def get_comparison_results(self, group1: str, group2: str) -> Optional[Tuple[Dict[Any, Tuple[float, float]], float]]:
+        """({feature Num: (log2 fold change group1/group2, p-value, 'first'/'second' if found in one group only)}, p-value threshold) of a univariate
+        comparison using the current abundance/imputation/feature-filter settings, or None if unavailable."""
+        active_data = self.stats_data.get_active_data()
+        if active_data is None or group1 not in self.stats_data.group_info or group2 not in self.stats_data.group_info:
+            return None
+        vd = UnivariateAnalysis.calculate_volcano_data(active_data, self.stats_data.group_info[group1], self.stats_data.group_info[group2], metadata=self.stats_data.feature_metadata)
+        if not vd.get("success", False):
+            return None
+        results = {}
+        for name, fc, p, m1, m2 in zip(vd["feature_names"], vd["log2_fc"], vd["pvalues"], vd["g1_means"], vd["g2_means"]):
+            # all replicates of a group are zero: no p-value can be calculated
+            found1, found2 = bool(np.isfinite(m1)), bool(np.isfinite(m2))
+            only = "first" if found1 and not found2 else "second" if found2 and not found1 else None
+            results[name] = (float(fc), float(p), only)
+        return results, vd["pvalue_threshold"]
 
     def highlight_features_by_id(self, feature_ids: List[Any]):
         """Highlight features selected in the Experiment results pane in the currently shown volcano plot(s)

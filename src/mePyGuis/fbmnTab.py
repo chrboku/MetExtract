@@ -196,7 +196,7 @@ def _draw_mirror(fig, data_a, spec_a, data_b, spec_b, score, pairs, fontsize=8, 
         ax.vlines(float(spec.get("precursor_mz")), 0, sign * 1e9, colors=color, linestyles="--", linewidth=1.0)
         peaks.append((mz, rel, y))
         explained = intens[mask].sum() / intens.sum() * 100.0 if intens.sum() > 0 else 0.0
-        stats.append(f"{label}: {_scan_info_text(info)}; {mz.size} fragments; the {int(mask.sum())} matched fragments explain {explained:.1f}% of the summed intensity; precursor m/z {float(spec.get('precursor_mz')):.4f} (dashed)")
+        stats.append(f"{label}: {_scan_info_text(info)}; {mz.size} fragments; {explained:.1f}% of the spectrum is explained by the {int(mask.sum())} matched fragments; precursor m/z {float(spec.get('precursor_mz')):.4f} (dashed)")
     stats.append(f"Score calculated from all {len(spec_a.peaks.mz)} + {len(spec_b.peaks.mz)} fragments; {len(pairs)} matched fragment pairs contribute (thick lines)")
 
     ax.axhline(0, color="black", linewidth=0.8)
@@ -424,6 +424,29 @@ NODE_SHAPES = [
     ("Abundance pie chart per group (median)", "pie_median"),
 ]
 ROUND_GLYPHS = ("spie", "pie_mean", "pie_median")
+UNIVARIATE_KIND = "univariate"
+# fill colors of the univariate comparison nodes; keys: direction (up/down) and significance (sig/ns)
+UNIVARIATE_DEFAULT_COLORS = {
+    "up_sig": "#D62728",
+    "up_ns": "#F4C4C4",
+    "down_sig": "#1F4FD6",
+    "down_ns": "#C2CFF4",
+    "only_first": "#FFA500",
+    "only_second": "#6B8E23",
+}
+UNIVARIATE_COLOR_LABELS = {
+    "up_sig": ("Increased, significant", "Increased (log2 fold change > 0) with a significant p-value"),
+    "up_ns": ("Increased, n.s.", "Increased (log2 fold change > 0) with a non-significant p-value"),
+    "down_sig": ("Decreased, significant", "Decreased (log2 fold change < 0) with a significant p-value"),
+    "down_ns": ("Decreased, n.s.", "Decreased (log2 fold change < 0) with a non-significant p-value"),
+    "only_first": ("Only in group 1", "Found only in the first group of the comparison (all replicates of the second group are zero), no p-value available"),
+    "only_second": ("Only in group 2", "Found only in the second group of the comparison (all replicates of the first group are zero), no p-value available"),
+}
+UNIVARIATE_MISSING_COLOR = "#D9D9D9"
+UNIVARIATE_MIN_RADIUS, UNIVARIATE_MAX_RADIUS = 6.0, 40.0
+# |log2 fold change| above this is not distinguished in the node size (e.g. features missing in one group)
+UNIVARIATE_FC_CAP = 10.0
+DEFAULT_PEN = QtGui.QPen(QtGui.QColor("#333333"), 1)
 
 
 class _NodeItem(QtWidgets.QGraphicsEllipseItem):
@@ -432,14 +455,16 @@ class _NodeItem(QtWidgets.QGraphicsEllipseItem):
         self.index = index
         self.feature = data
         self.radius = radius
+        self._abundance_radius = radius
         self._circle_radius = radius
         self._glyph = None
         self._glyph_kind = None
         self._highlighted = False
         self.edges = []
         self._base_brush = QtGui.QBrush(QtGui.QColor(FORM_COLORS.get(data["form"], "#1E90FF")))
+        self._base_pen = QtGui.QPen(DEFAULT_PEN)
         self.setBrush(self._base_brush)
-        self.setPen(QtGui.QPen(QtGui.QColor("#333333"), 1))
+        self.setPen(self._base_pen)
         self.setFlag(QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
         self.setFlag(QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
         self.setZValue(2)
@@ -465,13 +490,30 @@ class _NodeItem(QtWidgets.QGraphicsEllipseItem):
             self.setZValue(3)
         else:
             self.setBrush(self._base_brush)
-            self.setPen(QtGui.QPen(QtGui.QColor("#333333"), 1))
+            self.setPen(self._base_pen)
             self.setZValue(2)
 
     def set_base_color(self, color):
         self._base_brush = QtGui.QBrush(QtGui.QColor(color))
         if not self._highlighted:
             self.setBrush(self._base_brush)
+
+    def set_univariate(self, radius, color, pen_color):
+        """Draw the node as a circle of the given radius with the given (possibly translucent) fill and outline."""
+        self._circle_radius = radius
+        self._base_pen = QtGui.QPen(pen_color, 1)
+        self.set_base_color(color)
+        self.set_glyph(None)
+        if not self._highlighted:
+            self.setPen(self._base_pen)
+
+    def clear_univariate(self):
+        """Restore the abundance-based circle size and the default outline (the fill is reset by the caller)."""
+        self._circle_radius = self._abundance_radius
+        self._base_pen = QtGui.QPen(DEFAULT_PEN)
+        self.set_glyph(None)
+        if not self._highlighted:
+            self.setPen(self._base_pen)
 
     def base_color(self):
         return self._base_brush.color().name()
@@ -730,21 +772,30 @@ class FBMNWidget(QtWidgets.QWidget):
         self._get_group_abundances = None
         self._get_saved_network = None
         self._get_node_info = None
+        self._get_comparisons = None
+        self._get_comparison_results = None
+        self._comparisons = []
+        self._univariate_active = False
+        self._univariate_colors = {key: QtGui.QColor(color) for key, color in UNIVARIATE_DEFAULT_COLORS.items()}
         self._category_colors = {}
         self._popup = _SpectrumPopup(self)
         self._setup_ui()
 
-    def configure(self, get_nodes, algorithms, get_table=None, get_group_abundances=None, get_saved_network=None, get_node_info=None):
+    def configure(self, get_nodes, algorithms, get_table=None, get_group_abundances=None, get_saved_network=None, get_node_info=None, get_comparisons=None, get_comparison_results=None):
         """get_nodes(forms, selection) -> list of node dicts (or None if unavailable);
         get_table() -> loaded results sheet (polars DataFrame) or None;
         get_group_abundances([(num, form), ...]) -> {(num, form): [(group, color, values), ...]};
         get_saved_network() -> rows (dicts) of the saved network sheet or None;
-        get_node_info([(num, form), ...]) -> {(num, form): node dict without spectrum} from the results sheet."""
+        get_node_info([(num, form), ...]) -> {(num, form): node dict without spectrum} from the results sheet;
+        get_comparisons() -> [(group 1, group 2), ...] of the defined univariate comparisons;
+        get_comparison_results(group 1, group 2) -> ({Num: (log2 fold change, p-value, 'first'/'second' if found in only one group)}, p-value threshold) or None."""
         self._get_nodes = get_nodes
         self._get_table = get_table
         self._get_group_abundances = get_group_abundances
         self._get_saved_network = get_saved_network
         self._get_node_info = get_node_info
+        self._get_comparisons = get_comparisons
+        self._get_comparison_results = get_comparison_results
         self._algorithms = dict(algorithms)
         self.algorithm_combo.clear()
         self.algorithm_combo.addItems(list(self._algorithms.keys()))
@@ -806,7 +857,9 @@ class FBMNWidget(QtWidgets.QWidget):
         frag_row.addWidget(self.min_fragments_pct_spin)
         frag_widget = QtWidgets.QWidget()
         frag_widget.setLayout(frag_row)
-        frag_widget.setToolTip("A spectrum is only used if it has at least this many fragments with an intensity above the given percentage of its most abundant fragment.")
+        frag_widget.setToolTip(
+            "A spectrum is only used if it has at least this many fragments with an intensity above the given percentage of its most abundant fragment. Two nodes are only connected if at least this many fragments are matched between their spectra (in addition to the min. edge score)."
+        )
         form.addRow("Min. fragments:", frag_widget)
 
         self.min_score_spin = QtWidgets.QDoubleSpinBox()
@@ -865,11 +918,30 @@ class FBMNWidget(QtWidgets.QWidget):
             "Spie charts: one equal-angle wedge per sample, samples grouped (ascending within a group) and drawn in their group color.\n"
             "Pie charts: one equal-angle wedge per group showing the group's mean or median peak area.\n"
             "Wedge area is proportional to the peak area (relative to the largest wedge of the feature).\n"
-            "Native nodes use the _Area_N, labeled nodes the _Area_L columns."
+            "Native nodes use the _Area_N, labeled nodes the _Area_L columns.\n"
+            "Univariate comparisons (defined in the Statistics tab): circle size = |log2 fold change| (group 1 / group 2), "
+            "color by direction (increased/decreased) and significance of the p-value; the four colors can be changed."
         )
         self.node_shape_combo.currentIndexChanged.connect(lambda _i: self._apply_node_glyphs())
         shape_row.addWidget(self.node_shape_combo, 1)
         display_layout.addLayout(shape_row)
+        self.univariate_colors_widget = QtWidgets.QWidget()
+        uni_layout = QtWidgets.QGridLayout(self.univariate_colors_widget)
+        uni_layout.setContentsMargins(0, 0, 0, 0)
+        uni_layout.addWidget(QtWidgets.QLabel("Comparison colors:"), 0, 0, 1, 2)
+        self._univariate_color_buttons = {}
+        for k, (key, (label, tip)) in enumerate(UNIVARIATE_COLOR_LABELS.items()):
+            btn = QtWidgets.QPushButton(label)
+            btn.setToolTip(f"{tip}. Click to change the color.")
+            btn.clicked.connect(lambda _checked=False, key=key: self._pick_univariate_color(key))
+            self._univariate_color_buttons[key] = btn
+            uni_layout.addWidget(btn, 1 + k // 2, k % 2)
+        reset_btn = QtWidgets.QPushButton("Reset comparison colors")
+        reset_btn.clicked.connect(self._reset_univariate_colors)
+        uni_layout.addWidget(reset_btn, 1 + (len(UNIVARIATE_COLOR_LABELS) + 1) // 2, 0, 1, 2)
+        display_layout.addWidget(self.univariate_colors_widget)
+        self.univariate_colors_widget.setVisible(False)
+        self._style_univariate_buttons()
         left_layout.addWidget(display_box)
 
         self.save_btn = QtWidgets.QPushButton("Save network to results file")
@@ -1073,25 +1145,51 @@ class FBMNWidget(QtWidgets.QWidget):
         except (TypeError, IndexError, ValueError, KeyError):
             return float(result)
 
+    @staticmethod
+    def _pair_score_and_matches(algorithm, spec_a, spec_b):
+        """(score, number of matched fragments) of a spectrum pair."""
+        try:
+            result = algorithm.pair(spec_a, spec_b)
+        except Exception:
+            return 0.0, 0
+        try:
+            score = float(result["score"])
+        except (TypeError, IndexError, ValueError, KeyError):
+            score = float(result)
+        try:
+            matches = int(result["matches"])
+        except (TypeError, IndexError, ValueError, KeyError):
+            matches = len(_matched_peak_pairs(algorithm, spec_a, spec_b))
+        return score, matches
+
     def _score_matrix(self, algorithm, specs):
+        """(scores, matched fragments) matrices of all spectrum pairs; the matches are None if the algorithm does not report them."""
         try:
             try:
                 result = algorithm.matrix(specs, specs, is_symmetric=True, progress_bar=False)
             except TypeError:
                 result = algorithm.matrix(specs, specs, is_symmetric=True)
-            return np.asarray(result["score"] if result.dtype.names else result, dtype=float)
+            names = result.dtype.names or ()
+            scores = np.asarray(result["score"] if names else result, dtype=float)
+            matches = np.asarray(result["matches"], dtype=float) if "matches" in names else None
+            return scores, matches
         except Exception:
             n = len(specs)
             scores = np.zeros((n, n))
+            matches = np.zeros((n, n))
             for a in range(n):
                 for b in range(a + 1, n):
-                    scores[a, b] = scores[b, a] = self._pair_score(algorithm, specs[a], specs[b])
-            return scores
+                    score, n_matches = self._pair_score_and_matches(algorithm, specs[a], specs[b])
+                    scores[a, b] = scores[b, a] = score
+                    matches[a, b] = matches[b, a] = n_matches
+            return scores, matches
 
     def _compute_edges(self, nodes, specs):
-        """Return a list of (i, j, score) for node pairs above the score threshold, or None if cancelled.
-        Only spectra of the same form (native/labeled) and polarity are compared."""
+        """Return a list of (i, j, score) for node pairs with a score above the score threshold and at least the
+        minimum number of matched fragments, or None if cancelled. Only spectra of the same form (native/labeled)
+        and polarity are compared."""
         threshold = self.min_score_spin.value()
+        min_matches = self._gen_params["min_fragments"]
         tolerance = self._gen_params["tolerance"]
         use_ppm = self._gen_params["use_ppm"]
         self._nodes = nodes
@@ -1115,10 +1213,14 @@ class FBMNWidget(QtWidgets.QWidget):
                 if len(idxs) < 2:
                     continue
                 if not use_ppm:
-                    scores = self._score_matrix(self._make_algorithm(tolerance), [specs[i] for i in idxs])
+                    algorithm = self._make_algorithm(tolerance)
+                    scores, matches = self._score_matrix(algorithm, [specs[i] for i in idxs])
                     for a in range(len(idxs)):
                         for b in range(a + 1, len(idxs)):
-                            if scores[a, b] >= threshold:
+                            if scores[a, b] < threshold:
+                                continue
+                            n_matches = matches[a, b] if matches is not None else len(_matched_peak_pairs(algorithm, specs[idxs[a]], specs[idxs[b]]))
+                            if n_matches >= min_matches:
                                 edges.append((idxs[a], idxs[b], float(scores[a, b])))
                     done += len(idxs) * (len(idxs) - 1) // 2
                     progress.setValue(done)
@@ -1133,8 +1235,8 @@ class FBMNWidget(QtWidgets.QWidget):
                             tol_da = self._tolerance_for(ia, ib)
                             if tol_da not in algorithm_cache:
                                 algorithm_cache[tol_da] = self._make_algorithm(tol_da)
-                            score = self._pair_score(algorithm_cache[tol_da], specs[ia], specs[ib])
-                            if score >= threshold:
+                            score, n_matches = self._pair_score_and_matches(algorithm_cache[tol_da], specs[ia], specs[ib])
+                            if score >= threshold and n_matches >= min_matches:
                                 edges.append((ia, ib, score))
                             done += 1
                             if done % 200 == 0:
@@ -1186,6 +1288,7 @@ class FBMNWidget(QtWidgets.QWidget):
         self._update_score_visibility(self.show_scores_check.isChecked())
         self._set_network_buttons_enabled(True)
         self._refresh_color_columns()
+        self._refresh_univariate_options()
         self._apply_node_colors(ask=False)
         self._apply_node_glyphs()
         n_singletons = sum(1 for c in self._components if len(c) == 1)
@@ -1241,8 +1344,9 @@ class FBMNWidget(QtWidgets.QWidget):
         color per unique value (dialog shown if `ask`), or by form if no column is selected."""
         column = self.color_combo.currentData()
         self.edit_colors_btn.setEnabled(False)
-        if not self._node_items:
-            self.color_legend.setText("")
+        if not self._node_items or self._selected_comparison() is not None:
+            if not self._node_items:
+                self.color_legend.setText("")
             return
         if column is None:
             for item in self._node_items:
@@ -1293,9 +1397,132 @@ class FBMNWidget(QtWidgets.QWidget):
         more = f" &nbsp; (+{len(labels) - len(shown)} more)" if len(labels) > len(shown) else ""
         self.color_legend.setText(f"<b>{column}</b>: {entries}{more} &nbsp; <span style='color:{missing_color}'>&#9679;</span> missing")
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        # the statistics settings may have changed in the Statistics tab
+        self.refresh_univariate()
+
+    def refresh_univariate(self):
+        """Update the comparisons offered in the node shape list (e.g. after one was added or removed in the Statistics
+        tab) and redraw the nodes if the selected comparison may have changed."""
+        if self._refresh_univariate_options() or self._selected_comparison() is not None:
+            self._apply_node_glyphs()
+
+    def _style_univariate_buttons(self):
+        for key, btn in self._univariate_color_buttons.items():
+            color = self._univariate_colors[key]
+            fg = "black" if 0.299 * color.red() + 0.587 * color.green() + 0.114 * color.blue() > 128 else "white"
+            btn.setStyleSheet(f"background-color: {color.name()}; color: {fg}; border: 1px solid gray;")
+
+    def _pick_univariate_color(self, key):
+        chosen = QtWidgets.QColorDialog.getColor(self._univariate_colors[key], self, UNIVARIATE_COLOR_LABELS[key][0])
+        if chosen.isValid():
+            self._univariate_colors[key] = chosen
+            self._style_univariate_buttons()
+            self._apply_node_glyphs()
+
+    def _reset_univariate_colors(self):
+        self._univariate_colors = {key: QtGui.QColor(color) for key, color in UNIVARIATE_DEFAULT_COLORS.items()}
+        self._style_univariate_buttons()
+        self._apply_node_glyphs()
+
+    def _refresh_univariate_options(self):
+        """Append the univariate comparisons defined in the Statistics tab to the node shape combo (keeping the
+        current selection if it still exists). Returns True if the list of comparisons changed."""
+        comparisons = [tuple(c) for c in (self._get_comparisons() or [])] if self._get_comparisons else []
+        if comparisons == self._comparisons:
+            return False
+        current = self._selected_comparison()
+        self._comparisons = comparisons
+        self.node_shape_combo.blockSignals(True)
+        while self.node_shape_combo.count() > len(NODE_SHAPES):
+            self.node_shape_combo.removeItem(self.node_shape_combo.count() - 1)
+        for k, (g1, g2) in enumerate(comparisons):
+            self.node_shape_combo.addItem(f"Univariate: {g1} vs {g2}", f"{UNIVARIATE_KIND}:{k}")
+        idx = self.node_shape_combo.findData(f"{UNIVARIATE_KIND}:{comparisons.index(current)}") if current in comparisons else -1
+        if idx >= 0:
+            self.node_shape_combo.setCurrentIndex(idx)
+        elif current is not None or self.node_shape_combo.currentIndex() < 0:
+            self.node_shape_combo.setCurrentIndex(0)
+        self.node_shape_combo.blockSignals(False)
+        return True
+
+    def _selected_comparison(self):
+        """(group 1, group 2) of the selected univariate comparison, or None if a circle/chart shape is selected."""
+        data = self.node_shape_combo.currentData()
+        if isinstance(data, str) and data.startswith(f"{UNIVARIATE_KIND}:"):
+            k = int(data.split(":")[1])
+            if k < len(self._comparisons):
+                return self._comparisons[k]
+        return None
+
+    def _apply_univariate(self, pair):
+        """Size the circles by |log2 fold change| and color them red (increased) / blue (decreased), bold if the
+        p-value is significant and faint otherwise."""
+        g1, g2 = pair
+        results = None
+        if self._get_comparison_results is not None:
+            QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+            try:
+                results = self._get_comparison_results(g1, g2)
+            finally:
+                QtWidgets.QApplication.restoreOverrideCursor()
+        values, threshold = ({str(k): v for k, v in results[0].items()}, results[1]) if results else ({}, 0.05)
+        # (log2 fold change, p-value, "first"/"second" if found in only one group) per node, None without result
+        stats = []
+        for item in self._node_items:
+            s = values.get(str(item.feature["num"]))
+            if s is not None and s[2] is None and (s[0] is None or not np.isfinite(s[0])):
+                s = None
+            stats.append(s)
+        # features found in one group only have an arbitrarily large fold change and are drawn at the maximum size
+        scale = max(min(max((abs(s[0]) for s in stats if s and s[2] is None), default=1.0), UNIVARIATE_FC_CAP), 1.0)
+
+        self._univariate_active = True
+        self.color_combo.setEnabled(False)
+        self.edit_colors_btn.setEnabled(False)
+        missing = QtGui.QColor(UNIVARIATE_MISSING_COLOR)
+        for item, s in zip(self._node_items, stats):
+            if s is None or (s[2] is None and s[0] == 0):
+                fill, strong = missing, False
+                radius = UNIVARIATE_MIN_RADIUS
+            elif s[2] is not None:
+                fill, strong = self._univariate_colors[f"only_{s[2]}"], True
+                radius = UNIVARIATE_MAX_RADIUS
+            else:
+                fc, p, _ = s
+                strong = bool(p is not None and np.isfinite(p) and p <= threshold)
+                fill = self._univariate_colors[f"{'up' if fc > 0 else 'down'}_{'sig' if strong else 'ns'}"]
+                radius = UNIVARIATE_MIN_RADIUS + (UNIVARIATE_MAX_RADIUS - UNIVARIATE_MIN_RADIUS) * min(abs(fc), scale) / scale
+            item.set_univariate(radius, fill, fill.darker(150 if strong else 115))
+
+        def dot(color):
+            return f"<span style='color:{color.name()}'>&#9679;</span>"
+
+        colors = self._univariate_colors
+        note = "" if results else "<br><i>No results available for this comparison (check the Statistics tab).</i>"
+        self.color_legend.setText(
+            f"<b>{g1} vs {g2}</b> (log2 fold change = log2(mean {g1} / mean {g2}))<br>"
+            f"{dot(colors['up_sig'])} increased, p &le; {threshold:g} &nbsp; {dot(colors['up_ns'])} increased, n.s.<br>"
+            f"{dot(colors['down_sig'])} decreased, p &le; {threshold:g} &nbsp; {dot(colors['down_ns'])} decreased, n.s.<br>"
+            f"{dot(colors['only_first'])} only in {g1} &nbsp; {dot(colors['only_second'])} only in {g2} (no p-value) &nbsp; {dot(missing)} no result<br>"
+            f"Size: |log2 fold change| (largest circle = {scale:g}; features found in one group only are drawn at the maximum size).{note}"
+        )
+
     def _apply_node_glyphs(self):
+        pair = self._selected_comparison()
+        self.univariate_colors_widget.setVisible(pair is not None)
         if not self._node_items:
             return
+        if pair is not None:
+            self._apply_univariate(pair)
+            return
+        if self._univariate_active:
+            self._univariate_active = False
+            for item in self._node_items:
+                item.clear_univariate()
+            self.color_combo.setEnabled(True)
+            self._apply_node_colors(ask=False)
         kind = self.node_shape_combo.currentData()
         if kind is None or self._get_group_abundances is None:
             for item in self._node_items:

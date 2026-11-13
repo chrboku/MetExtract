@@ -176,5 +176,15 @@
         </div>
     </div>
 </div>
+<script>
+    // cancel default file handling (opening/navigating to the dropped files) and explain instead
+    for (const type of ["dragenter", "dragover"]) {
+        document.addEventListener(type, e => e.preventDefault());
+    }
+    document.addEventListener("drop", e => {
+        e.preventDefault();
+        alert("Files cannot be dropped here. Please use the Input tab.");
+    });
+</script>
 </body>
 </html>

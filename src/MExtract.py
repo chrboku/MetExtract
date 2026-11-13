@@ -32,6 +32,7 @@ import base64
 import functools
 import json
 import re
+from types import SimpleNamespace
 from collections import defaultdict
 from copy import deepcopy
 from math import log10
@@ -68,6 +69,7 @@ from .mePyGuis.annotationPanel import FeatureAnnotationsPanel
 from .mePyGuis.annotationBrowser import AnnotationBrowserWidget
 from .mePyGuis.fbmnTab import NETWORK_SHEET as FBMN_NETWORK_SHEET
 from .mePyGuis.fbmnTab import FBMNWidget
+from .mePyGuis.pinnedFeatureWindow import PinnedFeatureWindow, PinnedUiProxy, make_popout_icon, POPOUT_COLOR
 from .mePyGuis.libraryCache import LibraryCache
 from .MetExtractII_Main import MetExtractVersion
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -655,6 +657,13 @@ class _ExternalLinkWebEnginePage(QWebEnginePage):
             QDesktopServices.openUrl(url)
             return False
         return super().acceptNavigationRequest(url, navigationType, isMainFrame)
+
+    def javaScriptAlert(self, securityOrigin, msg):
+        # the page reports dropped files via alert() (see startup.html)
+        parent = self.parent()
+        if not isinstance(parent, QtWidgets.QWidget):
+            parent = None
+        QtWidgets.QMessageBox.warning(parent, "MetExtract II", msg)
 
     def createWindow(self, webWindowType):
         # links with target="_blank" request a new window instead of triggering
@@ -3211,13 +3220,27 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             self.drawCanvas(self.ui.resultsExperimentMSScanPeaks_plot)
             return
 
-        definedGroups = self.getAllSampleGroups()
-
         if not plotItems:
             self.drawCanvas(self.ui.resultsExperiment_plot)
             self.drawCanvas(self.ui.resultsExperimentSeparatedPeaks_plot)
             self.drawCanvas(self.ui.resultsExperimentMSScanPeaks_plot)
             return
+
+        self._renderExperimentEICs(plotItems)
+
+        # Update MSMS spectra list for selected features
+        selectedItems = self.ui.resultsExperiment_TreeWidget.selectedItems()
+        self.updateMSMSList_exp(selectedItems)
+
+        # Update peak details tab
+        self.updatePeakDetailsTab(plotItems)
+
+        # Update sample peaks tab
+        self.updateSamplePeaksTab(plotItems)
+
+    def _renderExperimentEICs(self, plotItems):
+        """Draw the raw XICs, separated peaks and MS1 scan plots of the given feature pairs (loaded raw data required)."""
+        definedGroups = self.getAllSampleGroups()
 
         ppm = self.ui.doubleSpinBox_resultsExperiment_EICppm.value()
         borderOffset = self.ui.doubleSpinBox_resultsExperiment_PeakWidth.value()
@@ -3524,16 +3547,6 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             self.drawCanvas(self.ui.resultsExperimentSeparatedPeaks_plot)
             self.drawCanvas(self.ui.resultsExperimentMSScanPeaks_plot)
 
-        # Update MSMS spectra list for selected features
-        selectedItems = self.ui.resultsExperiment_TreeWidget.selectedItems()
-        self.updateMSMSList_exp(selectedItems)
-
-        # Update peak details tab
-        self.updatePeakDetailsTab(plotItems)
-
-        # Update sample peaks tab
-        self.updateSamplePeaksTab(plotItems)
-
     def _getSelectedExperimentPlotItems(self):
         plotItems = []
         for item in self.ui.resultsExperiment_TreeWidget.selectedItems():
@@ -3545,6 +3558,67 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             if item.bunchData.type == "featurePair":
                 plotItems.append(item.bunchData)
         return plotItems
+
+    def _popOutSelectedFeature(self):
+        """Open a window with the Experiment results plots of the currently selected feature pair. The window has no
+        feature list and is not updated when the selection in the Experiment results changes (pinned feature)."""
+        plotItems = self._getSelectedExperimentPlotItems() if hasattr(self.ui, "resultsExperiment_TreeWidget") else []
+        if not plotItems:
+            QtWidgets.QMessageBox.information(self, "MetExtract", "Select a feature pair in the Experiment results first.")
+            return
+        window = PinnedFeatureWindow(plotItems)
+        window.refreshRequested.connect(self._renderPinnedFeatureWindow)
+
+        # interactions inside the window use the same handlers as the Experiment results, run on the window's widgets
+        window.msms_table.setItemDelegate(_MSMSTableDelegate(window.msms_table))
+        window.msms_table.itemSelectionChanged.connect(lambda w=window: self._inPinnedUi(w, self.plotSelectedMSMSSpectra_exp))
+        window.msms_sqrt_check.toggled.connect(lambda _checked, w=window: self._inPinnedUi(w, self.plotSelectedMSMSSpectra_exp))
+        window.msms_table.customContextMenuRequested.connect(lambda pos, w=window: self._inPinnedUi(w, self._show_msms_context_menu, w.msms_table, pos))
+        window.annotations_panel.configure(get_experimental_scan=lambda num, w=window: self._inPinnedUi(w, self._getRepresentativeMSMSScanForFeature, num))
+
+        if not hasattr(self, "_pinnedFeatureWindows"):
+            self._pinnedFeatureWindows = []
+        self._pinnedFeatureWindows.append(window)
+        window.destroyed.connect(lambda _obj=None, w=window: self._pinnedFeatureWindows.remove(w) if w in self._pinnedFeatureWindows else None)
+        window.show()
+        window.raise_()
+        window.activateWindow()
+        self._renderPinnedFeatureWindow(window)
+
+    def _inPinnedUi(self, window, func, *args):
+        """Run func(*args) with `self.ui` replaced by a proxy that maps the Experiment results plot, MS/MS and annotation
+        widgets to those of the pinned window, so the existing Experiment results code draws into the window."""
+        mainUi = self.ui
+        self.ui = PinnedUiProxy(mainUi, window.ui_overrides())
+        try:
+            return func(*args)
+        finally:
+            self.ui = mainUi
+
+    def _renderPinnedFeatureWindow(self, window):
+        """Draw all plots and tables of a pinned feature window with the code of the Experiment results."""
+        self._inPinnedUi(window, self._drawPinnedFeature, window)
+
+    def _drawPinnedFeature(self, window):
+        plotItems = window.plot_items
+        for plot in (window.eic_plot, window.separated_plot, window.ms_scan_plot):
+            self.clearPlot(plot)
+        rawLoaded = hasattr(self, "loadedMZXMLs") and self.loadedMZXMLs is not None
+        if rawLoaded:
+            self._renderExperimentEICs(plotItems)
+        else:
+            for plot in (window.eic_plot, window.separated_plot, window.ms_scan_plot):
+                self.drawCanvas(plot)
+        self.updateExperimentAbundancePlot(plotItems)
+        self.updateIsotopicPatternTab(plotItems)
+
+        # listing the MS/MS spectra also records which features have MS/MS for the Experiment results filter
+        msmsForms = getattr(self, "_exp_msms_feature_forms", None)
+        try:
+            self.updateMSMSList_exp([SimpleNamespace(bunchData=pi) for pi in plotItems])
+        finally:
+            self._exp_msms_feature_forms = msmsForms
+        self._updateFeatureAnnotationsPanel(plotItems)
 
     def _syncStatisticsFeatureHighlight(self, plotItems):
         """Highlight the currently selected Experiment results feature(s) in the Statistics tab's volcano plot(s)
@@ -17989,10 +18063,22 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             get_group_abundances=self._getFBMNGroupAbundances,
             get_saved_network=self._getFBMNSavedNetwork,
             get_node_info=self._getFBMNNodeInfo,
+            get_comparisons=self._getFBMNComparisons,
+            get_comparison_results=self._getFBMNComparisonResults,
         )
         self.ui.fbmnWidget.featureClicked.connect(self._showFeatureInExperimentResults)
         self.ui.fbmnWidget.saveClustersRequested.connect(self._saveFBMNClusters)
         return self.ui.fbmnWidget
+
+    def _getFBMNComparisons(self):
+        """The univariate comparisons [(group 1, group 2), ...] defined in the Statistics tab."""
+        widget = getattr(self.ui, "statisticsWidget", None)
+        return widget.get_comparisons() if widget is not None else []
+
+    def _getFBMNComparisonResults(self, group1, group2):
+        """({Num: (log2 fold change, p-value, 'first'/'second' if found in only one group)}, p-value threshold) of a Statistics tab comparison, or None."""
+        widget = getattr(self.ui, "statisticsWidget", None)
+        return widget.get_comparison_results(group1, group2) if widget is not None else None
 
     def _collectFBMNNodes(self, forms, selection):
         """Return one FBMN node dict per (visible feature pair, form) holding its most abundant
@@ -19409,6 +19495,14 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
         self.ui.showCustomFeature_pushButton.clicked.connect(self.showCustomFeature)
 
+        self.ui.popOutFeature_pushButton = QtWidgets.QPushButton(" Pop out feature")
+        self.ui.popOutFeature_pushButton.setIcon(make_popout_icon(32))
+        self.ui.popOutFeature_pushButton.setIconSize(QtCore.QSize(16, 16))
+        self.ui.popOutFeature_pushButton.setToolTip("Open the plots of the selected feature pair in a separate window. The window keeps this feature when another feature pair is selected in the Experiment results.")
+        self.ui.popOutFeature_pushButton.setStyleSheet(f"QPushButton {{ background-color: {POPOUT_COLOR}; color: white; font-weight: bold; border: 1px solid #CC7000; border-radius: 3px; }}QPushButton:hover {{ background-color: #FFA133; }}QPushButton:pressed {{ background-color: #E07B00; }}")
+        self.ui.horizontalLayout_12.addWidget(self.ui.popOutFeature_pushButton)
+        self.ui.popOutFeature_pushButton.clicked.connect(self._popOutSelectedFeature)
+
         self.ui.checkBox_expPeakArea.setVisible(False)
         self.ui.checkBox_expPeakApexIntensity.setVisible(False)
         self.ui.checkBox_expPeakSNR.setVisible(False)
@@ -19417,6 +19511,8 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         if hasattr(self.ui, "statisticsWidget"):
             self.ui.statisticsWidget.showFeatureInExperiment.connect(self._showFeatureInExperimentResults)
             self.ui.statisticsWidget.idsFilterRequested.connect(lambda ogroups, nums: self._addToIDFilter(ogroups=ogroups, nums=nums))
+            if hasattr(self.ui, "fbmnWidget"):
+                self.ui.statisticsWidget.comparisonsChanged.connect(self.ui.fbmnWidget.refresh_univariate)
 
         p = self.ui.scrollAreaWidgetContents_5.palette()
         p.setColor(self.ui.scrollAreaWidgetContents_5.backgroundRole(), QtCore.Qt.white)
@@ -19481,6 +19577,9 @@ class mainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
     def closeEvent(self, event):
         self._contMemoryWatcher = False
+        # pinned feature windows have no parent, so they are closed explicitly
+        for window in list(getattr(self, "_pinnedFeatureWindows", [])):
+            window.close()
 
 
 def main():
